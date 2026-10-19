@@ -88,6 +88,13 @@ esp_err_t bsp_tab5_orientation_init(void);
  * flip state changed. Safe to call when no IMU is present. */
 bool bsp_tab5_orientation_poll(void);
 
+/* Adopt the device's CURRENT orientation as upright and store it.
+ *
+ * The reference is normally learned automatically, but a rare bad latch would
+ * otherwise leave the flip inverted forever with no way back. Returns true when
+ * the on-screen flip state changed as a result. */
+bool bsp_tab5_orientation_set_upright(void);
+
 /* Last known orientation state. */
 void bsp_tab5_orientation_get(bsp_tab5_orient_t *out);
 // Initialise the ES8388 speaker DAC and return an esp_codec_dev output handle.

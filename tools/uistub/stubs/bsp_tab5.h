@@ -43,4 +43,5 @@ typedef struct {
 } bsp_tab5_orient_t;
 
 bool bsp_tab5_orientation_poll(void);
+bool bsp_tab5_orientation_set_upright(void);
 void bsp_tab5_orientation_get(bsp_tab5_orient_t *out);

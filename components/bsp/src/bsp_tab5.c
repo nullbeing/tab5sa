@@ -24,6 +24,7 @@
 #include "st7123/st7123_lcd.h"
 #include "st7123/st7123_touch.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_hosted.h"
 #ifdef CONFIG_BT_BLUEDROID_ENABLED
 #include "esp_hosted_bt.h"
@@ -508,7 +509,27 @@ void bsp_tab5_touch_wait_interrupt(void) {
  * (which puts ~1 g in plane) before trusting a direction. */
 #define ORIENT_LATCH_MG 600
 
+/* A direction is only adopted after it has held steady for about a second.
+ *
+ * Magnitude alone is not enough: while the device is being turned over, the
+ * in-plane component stays near 1 g the whole way while its *direction* sweeps
+ * through every angle. Latching during that sweep can capture a direction that
+ * is upside down, which leaves the flip inverted for the rest of the session.
+ * Requiring the direction to stay put is what makes the sample trustworthy. */
+#define ORIENT_STABLE_POLLS 10   /* at the 100 ms poll rate            */
+#define ORIENT_STABLE_COS2  9409 /* cos(14 deg)^2, scaled by 10000     */
+
+/* The upright direction is a property of how the board is mounted, so it is
+ * learned once and stored. Re-learning it on every boot turned the flip into a
+ * coin toss: whichever orientation the device happened to be in at that moment
+ * became "upright" for the whole session. */
+#define ORIENT_NVS_NAMESPACE "orient"
+#define ORIENT_NVS_KEY_X     "ref_x"
+#define ORIENT_NVS_KEY_Y     "ref_y"
+
 static int32_t orient_ema[3];
+static int32_t orient_cand_x, orient_cand_y; /* direction being evaluated */
+static int orient_cand_n;                    /* consecutive stable polls  */
 static int16_t orient_rx, orient_ry, orient_rz;
 
 static void orient_read_raw(int16_t *x, int16_t *y, int16_t *z)
@@ -533,6 +554,68 @@ static bool orient_inplane_strong(int32_t x, int32_t y)
     return x * x + y * y >= ORIENT_LATCH_MG * ORIENT_LATCH_MG;
 }
 
+/* NVS is only initialised on demand: the BSP does it for WiFi/BT, and this build
+ * enables neither, but the orientation reference still needs a home. */
+static bool orient_nvs_ready(void)
+{
+    static int state; /* 0 = untried, 1 = ok, -1 = unavailable */
+    if (state) return state > 0;
+
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        if (nvs_flash_erase() == ESP_OK) err = nvs_flash_init();
+    }
+    state = (err == ESP_OK) ? 1 : -1;
+    if (state < 0)
+        ESP_LOGW(TAG, "NVS unavailable; orientation will be re-learned each boot");
+    return state > 0;
+}
+
+static bool orient_ref_load(void)
+{
+    if (!orient_nvs_ready()) return false;
+
+    nvs_handle_t h;
+    if (nvs_open(ORIENT_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
+
+    int32_t x = 0, y = 0;
+    esp_err_t ex = nvs_get_i32(h, ORIENT_NVS_KEY_X, &x);
+    esp_err_t ey = nvs_get_i32(h, ORIENT_NVS_KEY_Y, &y);
+    nvs_close(h);
+
+    if (ex != ESP_OK || ey != ESP_OK) return false;
+    if (!orient_inplane_strong(x, y)) return false; /* stale or corrupt */
+
+    orient_ref_x = x;
+    orient_ref_y = y;
+    orient_ref_valid = true;
+    return true;
+}
+
+static void orient_ref_save(int32_t x, int32_t y)
+{
+    if (!orient_nvs_ready()) return;
+
+    nvs_handle_t h;
+    if (nvs_open(ORIENT_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    if (nvs_set_i32(h, ORIENT_NVS_KEY_X, x) == ESP_OK &&
+        nvs_set_i32(h, ORIENT_NVS_KEY_Y, y) == ESP_OK)
+        nvs_commit(h);
+    nvs_close(h);
+}
+
+/* Adopt `x,y` as the upright direction and remember it. */
+static void orient_ref_adopt(int32_t x, int32_t y)
+{
+    orient_ref_x = x;
+    orient_ref_y = y;
+    orient_ref_valid = true;
+    orient_cand_n = 0;
+    orient_flipped = false;
+    orient_ref_save(x, y);
+    ESP_LOGI(TAG, "orientation reference %+ld/%+ld mg (upright)", (long)x, (long)y);
+}
+
 esp_err_t bsp_tab5_orientation_init(void)
 {
     if (bmi270_init(i2c0, &bmi270) != ESP_OK) return ESP_ERR_NOT_FOUND;
@@ -550,21 +633,18 @@ esp_err_t bsp_tab5_orientation_init(void)
     orient_ema[1] = sy / 8;
     orient_ema[2] = sz / 8;
 
-    if (orient_inplane_strong(orient_ema[0], orient_ema[1])) {
-        orient_ref_x = orient_ema[0];
-        orient_ref_y = orient_ema[1];
-        orient_ref_valid = true;
-        ESP_LOGI(TAG, "orientation reference %+ld/%+ld mg (this is upright)",
+    /* Do not latch here. Even a strong reading says nothing about whether the
+     * device is being moved at this instant; the poll loop learns it once the
+     * direction has been stable for a while. Until then the screen stays
+     * upright, which is the harmless default. */
+    orient_flipped = false;
+
+    if (orient_ref_load()) {
+        ESP_LOGI(TAG, "orientation reference restored %+ld/%+ld mg",
                  (long)orient_ref_x, (long)orient_ref_y);
     } else {
-        /* Booted flat or at an angle. The in-plane direction is only meaningful
-         * once the device is held up, so learn it then rather than locking in
-         * noise that would mis-flip the screen later. */
-        ESP_LOGI(TAG, "booted flat (%+ld/%+ld mg); reference latched on pickup",
-                 (long)orient_ema[0], (long)orient_ema[1]);
+        ESP_LOGI(TAG, "no stored orientation; will learn once held still");
     }
-
-    orient_flipped = false;
     return ESP_OK;
 }
 
@@ -602,13 +682,37 @@ bool bsp_tab5_orientation_poll(void)
     if (!orient_inplane_significant(cx, cy)) return false;
 
     if (!orient_ref_valid) {
-        /* Wait for a trustworthy direction before learning "upright". */
-        if (!orient_inplane_strong(cx, cy)) return false;
-        orient_ref_x = cx;
-        orient_ref_y = cy;
-        orient_ref_valid = true;
-        ESP_LOGI(TAG, "orientation reference %+ld/%+ld mg (this is upright)",
-                 (long)cx, (long)cy);
+        /* Learn only from a direction that is both strong and steady. */
+        if (!orient_inplane_strong(cx, cy)) {
+            orient_cand_n = 0;
+            return false;
+        }
+
+        if (orient_cand_n == 0) {
+            orient_cand_x = cx;
+            orient_cand_y = cy;
+            orient_cand_n = 1;
+            return false;
+        }
+
+        /* Still pointing the same way as the candidate? cos^2 > cos(14deg)^2. */
+        int64_t d  = (int64_t)cx * orient_cand_x + (int64_t)cy * orient_cand_y;
+        int64_t tt = (int64_t)(cx * cx + cy * cy) *
+                     (int64_t)(orient_cand_x * orient_cand_x + orient_cand_y * orient_cand_y);
+        if (d > 0 && 10000 * d * d > (int64_t)ORIENT_STABLE_COS2 * tt) {
+            orient_cand_n++;
+            /* Track the candidate as a running average so it settles exactly
+             * on the resting direction rather than on the first sample. */
+            orient_cand_x += (cx - orient_cand_x) / 4;
+            orient_cand_y += (cy - orient_cand_y) / 4;
+        } else {
+            orient_cand_x = cx;
+            orient_cand_y = cy;
+            orient_cand_n = 1;
+        }
+
+        if (orient_cand_n >= ORIENT_STABLE_POLLS)
+            orient_ref_adopt(orient_cand_x, orient_cand_y);
         return false;
     }
 
@@ -630,6 +734,23 @@ bool bsp_tab5_orientation_poll(void)
     }
 
     return orient_flipped != was;
+}
+
+bool bsp_tab5_orientation_set_upright(void)
+{
+    if (!bmi270) return false;
+
+    int32_t cx = orient_ema[0], cy = orient_ema[1];
+    if (!orient_inplane_strong(cx, cy)) {
+        ESP_LOGW(TAG, "cannot set upright: only %+ld/%+ld mg in plane (too flat)",
+                 (long)cx, (long)cy);
+        return false;
+    }
+
+    bool changed = orient_flipped;
+    orient_ref_adopt(cx, cy);
+    ESP_LOGI(TAG, "upright set manually from the current orientation");
+    return changed;
 }
 
 void bsp_tab5_orientation_get(bsp_tab5_orient_t *out)

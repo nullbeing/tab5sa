@@ -185,6 +185,15 @@ bool bsp_tab5_orientation_poll(void)
     return false;
 }
 
+bool bsp_tab5_orientation_set_upright(void)
+{
+    /* Long-press on the mode badge: adopt the current orientation as upright. */
+    bool changed = g_imu_flipped;
+    g_imu_flipped = false;
+    fprintf(stderr, "[stub] orientation set upright\n");
+    return changed;
+}
+
 void bsp_tab5_orientation_get(bsp_tab5_orient_t *o)
 {
     memset(o, 0, sizeof *o);

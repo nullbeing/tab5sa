@@ -59,6 +59,12 @@ static const char *TAG = "ui";
 #define MODE_BOX_X1 638
 #define MODE_BOX_Y1  50
 
+/* Holding the mode badge for this many polls (≈8 ms each) declares the current
+ * orientation upright. This is the escape hatch for a bad automatic latch: the
+ * reference is normally learned and stored, but if it ever comes out inverted the
+ * screen would otherwise stay wrong with no way back. */
+#define MODE_LONG_POLLS 80
+
 /* Volume: a vertical 8-step bar in the right-hand gutter beside the waterfall.
  * That strip was dead space (the waterfall only paints PLOT_W columns, and the
  * dBm labels stop at the spectrum's bottom edge), so the control costs no
@@ -166,6 +172,7 @@ static volatile bool s_redraw; /* set by ui_set_freq()/ui_set_mode()  */
 /* Touch state. The panel reports portrait coordinates, which are mapped back
  * into this landscape buffer by the ui_task loop. */
 static bool s_mode_hot;   /* finger is currently on the WFM/NFM badge     */
+static int  s_mode_hold;  /* polls the badge has been held               */
 static bool s_vol_hot;    /* finger is currently on the volume bar       */
 
 /* Screen orientation. Driven by the IMU: when the device is turned upside down
@@ -1040,7 +1047,6 @@ static bool handle_touch(void)
     static int drag_x0, tap_x, run, grace;
     static uint32_t drag_f0;
     bool changed = false;
-
     esp_lcd_touch_point_data_t p;
     int n = bsp_tab5_touch_read(&p, 1);
 
@@ -1101,17 +1107,34 @@ static bool handle_touch(void)
         }
         dragging = false;
         moved = false;
-        if (s_mode_hot) { s_mode_hot = false; changed = true; }
+        if (s_mode_hot) {
+            s_mode_hot = false;
+            /* Short tap switches demod; a long press re-learns "upright" from
+             * the way the device is being held right now. */
+            if (s_mode_hold >= MODE_LONG_POLLS) {
+                bsp_tab5_orientation_set_upright();
+                bsp_tab5_orient_t o;
+                bsp_tab5_orientation_get(&o);
+                s_flipped = o.flipped;
+            } else {
+                toggle_mode();
+            }
+            s_mode_hold = 0;
+            changed = true;
+        }
         if (s_vol_hot)  { s_vol_hot  = false; changed = true; }
     }
 
     if (edge && lx >= MODE_BOX_X0 && lx < MODE_BOX_X1 &&
         ly >= MODE_BOX_Y0 && ly < MODE_BOX_Y1) {
-        /* WFM/NFM badge: tap toggles the demodulation standard. */
-        toggle_mode();
+        /* Mode badge: act on RELEASE, so a hold can mean something different
+         * from a tap (see the release branch). */
         s_mode_hot = true;
+        s_mode_hold = 0;
         dragging = false;
         changed = true;
+    } else if (pressed && s_mode_hot) {
+        s_mode_hold++;
     } else if (edge && lx >= FREQ_BOX_X0 && lx < FREQ_BOX_X1 &&
                ly >= FREQ_BOX_Y0 && ly < FREQ_BOX_Y1) {
         /* Tap the big 7-segment readout to type a frequency directly. */
