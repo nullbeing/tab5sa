@@ -35,15 +35,18 @@ void bsp_tab5_set_usb_host_power(bool on);
  * plugged in: the 2S pack is charged by an IP2326 whose enable line (CHG_EN) is
  * driven by the PI4IOE5V6408 I/O expander. bsp_tab5_init() asserts it so the
  * device accepts charging from boot, and it stays enabled until explicitly
- * turned off. Charge state comes back on CHG_STAT (open-drain, LOW = charging)
- * and the pack voltage/current from the INA226 across the 5 mOhm shunt R39.
+ * turned off. Charge state comes back on CHG_STAT, the IP2326 BAT_STAT line:
+ * LOW while trickle charging, HIGH once constant-current charging begins, so
+ * HIGH means the charger is working. It is read with a pull-down, so an idle
+ * or terminated charger reads LOW. The pack voltage/current come from the
+ * INA226 across the 5 mOhm shunt R39.
  */
 typedef struct {
     bool present;    /* INA226 answered on the I2C bus            */
     int32_t mv;      /* pack voltage in millivolts (2S)           */
     float ma;        /* current: >0 into the pack (charging)      */
     int percent;     /* 0..100, from the 2S discharge curve       */
-    bool charging;   /* CHG_STAT asserted (LOW)                   */
+    bool charging;   /* IP2326 BAT_STAT high and CHG_EN asserted  */
     bool external;   /* external power likely present             */
 } bsp_tab5_battery_t;
 

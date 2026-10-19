@@ -153,7 +153,7 @@ esp_err_t bsp_tab5_init(const bsp_tab5_config_t *config) {
         [3] = { PI4IO_PIN_MODE_OUTPUT, .initial_value = false },  // USB5V_EN
         [4] = { PI4IO_PIN_MODE_OUTPUT, .initial_value = false },  // PWROFF_PLUSE
         [5] = { PI4IO_PIN_MODE_OUTPUT, .initial_value = false },  // nCHG_QC_EN
-        [6] = { PI4IO_PIN_MODE_INPUT,  .pull = PI4IO_PULL_UP },   // CHG_STAT
+        [6] = { PI4IO_PIN_MODE_INPUT,  .pull = PI4IO_PULL_DOWN },  // CHG_STAT
         // CHG_EN must be HIGH from boot. Unlike a plain ESP32 dev board, the
         // Tab5 charges its 2S pack through an IP2326 whose enable line is
         // driven from here — leaving it low means the device never charges,
@@ -417,9 +417,11 @@ void bsp_tab5_battery_read(bsp_tab5_battery_t *out) {
     bool external = false;
     if (pi4ioe2) {
         bool stat = false;
-        /* PI4IOE2 bit6 is the IP2326 status/USB-C-detect line. The M5Stack BSP
-         * reads it as "USB-C present" (high = present), so treat it as the
-         * external-power flag rather than as "charging". */
+        /* PI4IOE2 bit6 is the IP2326 BAT_STAT line. Per the IP2326 datasheet it
+         * is LOW while trickle charging and HIGH once constant-current charging
+         * begins, so HIGH means "the charger is working". The pin is configured
+         * with a pull-DOWN (matching the M5Stack BSP, which also pulls P6 down),
+         * so an idle or terminated charger reads LOW instead of floating high. */
         if (pi4io_get_input(pi4ioe2, 6, &stat) == ESP_OK) external = stat;
     }
     out->external = external;
@@ -440,12 +442,13 @@ void bsp_tab5_battery_read(bsp_tab5_battery_t *out) {
     out->mv = mv;
     out->ma = ma;
     out->percent = pack_percent(mv);
-    /* Only call it "charging" when external power is present AND a real
-     * current is flowing through the pack shunt. With the board powered from
-     * a plain 5 V USB port the IP2326 can sit idle (0 mA), and reporting that
-     * as "charging" would be a lie. */
-    float abs_ma = ma < 0 ? -ma : ma;
-    out->charging = external && abs_ma > 30.0f;
+    /* Charging is decided by the IP2326 status line, NOT by the shunt current.
+     * In the constant-voltage phase the current tapers towards zero and then
+     * terminates, so a pack at 97% draws ~0 mA while it is still being charged.
+     * The old `abs_ma > 30` test therefore reported "discharging" for exactly
+     * the case this indicator exists for — measured on hardware as
+     * `bat 8.33V +0mA 97% dischg` with the charger connected. */
+    out->charging = external && charge_enabled;
 }
 
 void bsp_tab5_battery_dump(void) {
