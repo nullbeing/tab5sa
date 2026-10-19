@@ -21,6 +21,7 @@
 #include "dsp.h"
 #include "audio.h"
 #include "ui.h"
+#include "shot.h"
 
 static const char *TAG = "tab5sa";
 
@@ -79,6 +80,8 @@ void app_main(void)
     audio_init();
     dsp_start();
     ui_start();
+    /* After ui_start(): the capture path reads the panel framebuffer ui.c owns. */
+    shot_start();
 
     /* Heartbeat: produced= is what proves IQ is actually arriving (dropped=
      * stays 0 both when the consumer keeps up AND when nothing is produced).

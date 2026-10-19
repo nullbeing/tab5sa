@@ -23,6 +23,7 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -176,6 +177,12 @@ static const char *TAG = "ui";
 static uint16_t *LBUF;
 static ppa_client_handle_t s_ppa;
 static int s_fb_index;
+/* Index of the buffer the PPA last finished writing, and whether there has been
+ * one at all. Guarded by s_present_lock so a screenshot cannot copy a buffer
+ * while the PPA is still filling it. */
+static int s_last_fb;
+static bool s_last_valid;
+static SemaphoreHandle_t s_present_lock;
 static uint16_t s_wlut[256]; /* waterfall LUT: black -> magenta -> cyan -> white */
 
 static uint32_t s_center;
@@ -1076,6 +1083,12 @@ static void draw_footer(void)
 
 static void present(void)
 {
+    /* Serialised against ui_panel_snapshot(): the PPA writes into one buffer
+     * while the panel DMA reads the other, so a screenshot must never copy the
+     * buffer that is mid-write. Holding this across the PPA operation makes the
+     * copy see only finished frames. */
+    if (s_present_lock) xSemaphoreTake(s_present_lock, portMAX_DELAY);
+
     /* 90° maps the landscape buffer onto the portrait panel upright; 270° is the
      * same rotation the other way, which turns the whole image upside down.
      * Both produce 360x640 before the 2x scale, so the output geometry is
@@ -1091,7 +1104,28 @@ static void present(void)
         .scale_x = SCALE, .scale_y = SCALE,
     });
     bsp_tab5_display_flush(s_fb_index);
+
+    s_last_fb = s_fb_index;
+    s_last_valid = true;
     s_fb_index ^= 1;
+
+    if (s_present_lock) xSemaphoreGive(s_present_lock);
+}
+
+bool ui_panel_snapshot(uint16_t *dst, int *w, int *h)
+{
+    if (!dst || !s_present_lock) return false;
+
+    xSemaphoreTake(s_present_lock, portMAX_DELAY);
+    bool ok = s_last_valid;
+    if (ok) {
+        memcpy(dst, bsp_tab5_display_get_frame_buffer(s_last_fb),
+               (size_t)PANEL_W * PANEL_H * 2);
+        if (w) *w = PANEL_W;
+        if (h) *h = PANEL_H;
+    }
+    xSemaphoreGive(s_present_lock);
+    return ok;
 }
 
 /* Static "receiver stopped" picture.
@@ -1590,6 +1624,10 @@ void ui_start(void)
     if (!LBUF) { ESP_LOGE(TAG, "no PSRAM for landscape buffer"); return; }
     ESP_ERROR_CHECK(ppa_register_client(&(ppa_client_config_t){ .oper_type = PPA_OPERATION_SRM }, &s_ppa));
     build_wlut();
+
+    /* Created before the render task starts, so present() never runs unlocked. */
+    s_present_lock = xSemaphoreCreateMutex();
+    if (!s_present_lock) ESP_LOGE(TAG, "no mutex for the panel snapshot");
 
     sdr_stats_t st;
     sdr_get_stats(&st);

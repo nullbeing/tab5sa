@@ -93,6 +93,9 @@ flashing link, so the UI reports `NO RTL-SDR` instead of freezing.
 `tools/uistub/` renders the real `ui.c` on the host so layout can be iterated
 without a flash cycle.
 
+`tools/shot.py` captures the live panel over USB-C (`S` on the serial port →
+720x1280 RGB565 frame, saved as PNG). No extra wiring.
+
 ## Credits & license
 
 **GPL-2.0-or-later** (see [LICENSE](LICENSE)), as required by librtlsdr.
