@@ -39,6 +39,12 @@ void sdr_start(uint32_t center_freq, uint32_t sample_rate);
 /* True while a dongle is open and streaming. Safe to poll from any task. */
 bool sdr_is_present(void);
 
+/* Master run/stop. When false the supervisor releases the dongle and leaves it
+ * released, so no IQ is read at all (not merely ignored). The tuned frequency
+ * is remembered, so going back to true resumes where it left off. */
+void sdr_set_running(bool on);
+bool sdr_get_running(void);
+
 /* Retune. Always records the request (so it survives a hot-plug) and only
  * touches hardware when a dongle is actually streaming. Returns 0 if the
  * request was accepted, -1 if the tuner rejected it. */

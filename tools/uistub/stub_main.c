@@ -146,7 +146,7 @@ int bsp_tab5_touch_read(esp_lcd_touch_point_data_t *points, uint8_t max_points)
 
 static uint32_t g_center = 100000000u;
 static int g_mode;
-static bool g_mute;
+static bool g_rx_on = true;
 static bool g_imu_flipped;
 static int g_vol = 8;
 
@@ -162,7 +162,9 @@ void sdr_get_stats(sdr_stats_t *o)
 }
 
 int sdr_set_center_freq(uint32_t f) { (void)f; return 0; }
-bool sdr_is_present(void) { return true; }
+bool sdr_is_present(void) { return g_rx_on; }
+void sdr_set_running(bool on) { g_rx_on = on; }
+bool sdr_get_running(void) { return g_rx_on; }
 
 void audio_set_volume(int v) { (void)v; }
 
@@ -212,15 +214,13 @@ static float g_spec[4][BINS];
 static int g_frame;
 
 int dsp_spectrum_bins(void) { return BINS; }
-const float *dsp_spectrum(void) { return g_spec[g_frame & 3]; }
+const float *dsp_spectrum(void) { return g_rx_on ? g_spec[g_frame & 3] : NULL; }
 float dsp_signal_db(void) { return 10.0f; }
 float dsp_noise_floor_db(void) { return 20.0f; }
 void dsp_flush_spectrum(void) {}
 void dsp_set_mode(int m) { g_mode = m; }
 int dsp_get_mode(void) { return g_mode; }
 void dsp_set_squelch_db(float d) { (void)d; }
-void dsp_set_mute(bool m) { g_mute = m; }
-bool dsp_get_mute(void) { return g_mute; }
 float dsp_get_squelch_db(void) { return -200.0f; }
 
 /*

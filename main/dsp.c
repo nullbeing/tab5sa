@@ -89,11 +89,6 @@ static float d_dc;
 /* Squelch / signal level. */
 static volatile float s_sig_db = -120.0f;
 static volatile float s_squelch_db = -200.0f; /* disabled by default */
-/* Master mute for the demodulated output, driven by the play/stop button. This
- * is deliberately separate from the squelch: the squelch closes per-block when
- * the signal drops (so it chatters at the edge of a carrier), while this is a
- * latch the user owns and that must not depend on the signal at all. */
-static volatile bool s_mute;
 
 /* Noise-floor tracker (same dB scale): follows new minima instantly, rises
  * only slowly so occupied channels don't lift the floor. Seeded from the first
@@ -112,7 +107,7 @@ static void demod_block(void)
     int naud = 0;
     float ifpow = 0;
     int nif = 0;
-    bool open = !s_mute && s_sig_db >= s_squelch_db;
+    bool open = s_sig_db >= s_squelch_db;
 
     int dif = s_decim_if, daud = s_decim_audio;
     float inv_if = s_inv_if, inv_aud = s_inv_audio, dea = s_deemph_a, gain = s_gain;
@@ -251,9 +246,6 @@ const float *dsp_spectrum(void)
 
 void dsp_set_squelch_db(float db) { s_squelch_db = db; }
 float dsp_get_squelch_db(void) { return s_squelch_db; }
-
-void dsp_set_mute(bool mute) { s_mute = mute; }
-bool dsp_get_mute(void) { return s_mute; }
 float dsp_signal_db(void) { return s_sig_db; }
 float dsp_noise_floor_db(void) { return s_nf_db; }
 

@@ -6,7 +6,6 @@
  */
 #pragma once
 #include <stdint.h>
-#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,11 +42,6 @@ const float *dsp_spectrum(void);
  * value (e.g. -200) to disable. */
 void dsp_set_squelch_db(float db);
 float dsp_get_squelch_db(void);
-
-/* Latch the demodulated audio off/on regardless of signal level. Independent of
- * the squelch: this is a user request, the squelch is an automatic gate. */
-void dsp_set_mute(bool mute);
-bool dsp_get_mute(void);
 
 /* Current smoothed signal level (dB, same scale as the squelch threshold).
  * This is demodulated IF power, NOT the dsp_spectrum() dBm scale. */

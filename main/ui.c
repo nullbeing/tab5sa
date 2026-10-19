@@ -204,6 +204,10 @@ static int  s_scan_hot;   /* scan button under the finger, -1 = none     */
  * has nothing to do with where the receiver is tuned. A manual tune cancels a
  * hunt, so the user can always take back control. */
 static int  s_scan_dir;
+/* Set when the receiver has just been stopped; consumed by ui_task AFTER it has
+ * drawn the current frame, so the blank-out cannot be overwritten by the
+ * spectrum pointer fetched earlier in the same iteration. */
+static bool s_rx_off_paint;
 static int  s_scan_left;
 static int64_t s_scan_next;
 static bool s_vol_hot;    /* finger is currently on the volume bar       */
@@ -561,13 +565,15 @@ static void draw_battery(void)
  * They are not a media transport: a spectrum analyzer has nothing to rewind.
  * Instead, left to right:
  *   [0] seek down    hunt downward and park on the first signal found
- *   [1] play / stop  latch the demodulated audio off/on (does NOT retune)
+ *   [1] play / stop  run/stop the receiver itself (does NOT retune)
  *   [2] seek up      same as [0], upward
  *
  * Seek is what the arrows are for: with 1.15 MHz on screen, nudging by one
  * step is already covered by dragging, so hunting is the useful behaviour.
- * The middle button is deliberately not a sweep — the arrows own frequency, so
- * this one owns audio, and neither has to know what the other is doing.
+ * The middle button is not a sweep: the arrows own frequency, this one owns
+ * whether the receiver works at all. Stopping is a real stop — sdr releases the
+ * dongle, so no IQ is read and the plot goes to the same static "no data"
+ * state as an unplugged receiver. It is not a mute.
  */
 static void scan_btn_x(int idx, int *x)
 {
@@ -591,7 +597,7 @@ static void draw_scan_buttons(void)
     /* Left-to-right: hunt down, play/stop decode, hunt up. The middle button
      * does not move the receiver at all — it latches the demodulator mute, so
      * the arrows are the only things that change frequency. */
-    bool playing = !dsp_get_mute();
+    bool playing = sdr_get_running();
 
     for (int i = 0; i < SCAN_BTN_N; i++) {
         int x;
@@ -1088,6 +1094,30 @@ static void present(void)
     s_fb_index ^= 1;
 }
 
+/* Static "receiver stopped" picture.
+ *
+ * Same layout as an idle receiver, but blanked on purpose: the plot and the
+ * waterfall are the two things that are only meaningful while IQ is flowing, so
+ * leaving the last frame on screen would look like a live but silent band. The
+ * graticule and ruler stay, because they describe the tuning, not the signal. */
+static void draw_rx_off(void)
+{
+    const int y0 = SPEC_Y0;
+    const int h  = (WF_Y0 + WF_H) - y0;
+
+    rect(0, y0, LW, h, COL_BG);
+    draw_graticule();
+    draw_ruler();
+
+    int cy = WF_Y0 + WF_H / 2;
+    text_c(LW / 2, cy - 12, 2, COL_YELLOW, "STOPPED");
+    text_c(LW / 2, cy + 12, 1, COL_DIM, "press play to resume");
+
+    draw_header();
+    draw_volume();
+    draw_footer();
+}
+
 /* ---- touch --------------------------------------------------------------- */
 
 /* Tuning sensitivity while dragging. The visible span is only
@@ -1299,9 +1329,21 @@ static bool handle_touch(void)
          * there is nothing to fine-tune by sliding. */
         int b = scan_hit(lx, ly);
         if (b == 1) {
-            /* Play/stop decode: latches the demodulator mute, independent of
-             * where the receiver is tuned and of the squelch. */
-            dsp_set_mute(!dsp_get_mute());
+            /* Play/stop is a real run/stop, not a mute: stopping releases the
+             * dongle, so no IQ is read at all and the screen goes to the same
+             * static "no data" state as an unplugged receiver. */
+            bool on = !sdr_get_running();
+            sdr_set_running(on);
+            if (!on) {
+                /* Drop the half-accumulated frame so the frozen picture cannot
+                 * be mistaken for a live one. The repaint is only flagged here,
+                 * NOT done here: ui_task fetches the spectrum pointer before it
+                 * calls handle_touch(), so painting now would be immediately
+                 * overwritten by draw_spectrum() using that stale pointer —
+                 * leaving one full frame frozen on screen forever. */
+                dsp_flush_spectrum();
+                s_rx_off_paint = true;
+            }
             s_redraw = true;
         } else {
             /* Arrows hunt in one direction and park on the first signal. */
@@ -1502,7 +1544,11 @@ static void ui_task(void *arg)
                 no_shown = true;
                 idle_repaint = 0;
                 draw_header();
-                if (!sdr_is_present()) {
+                if (!sdr_get_running()) {
+                    /* Deliberately stopped: this is not a fault, so do not
+                     * blame the cable. */
+                    text_c(LW / 2, WF_Y0 + WF_H / 2, 2, COL_YELLOW, "STOPPED");
+                } else if (!sdr_is_present()) {
                     text_c(LW / 2, WF_Y0 + WF_H / 2 - 12, 2, COL_YELLOW, "NO RTL-SDR");
                     text_c(LW / 2, WF_Y0 + WF_H / 2 + 12, 1, COL_DIM,
                            "plug the dongle into the USB-A port");
@@ -1512,6 +1558,15 @@ static void ui_task(void *arg)
                 draw_footer();
                 present();
             }
+        }
+
+        /* Stopped just now: blank the plot and waterfall once, after any frame
+         * that was already in flight has been drawn. Doing this inside
+         * handle_touch() would lose the race against draw_spectrum(). */
+        if (s_rx_off_paint) {
+            s_rx_off_paint = false;
+            draw_rx_off();
+            present();
         }
 
         /* A gesture can change the mode badge, the tuned frequency or the
