@@ -859,7 +859,15 @@ static void draw_spectrum(const float *spec, int bins)
         char tb[10];
         float sec = (float)(i * (WF_H - 1) / MARKS) / (s_fps > 0 ? s_fps : 20);
         snprintf(tb, sizeof tb, "-%.1f", sec);
-        text_r(PLOT_X0 - 7, y - 3, 1, COL_DIM, tb);
+
+        /* Keep the label inside the waterfall band. The last tick sits on the
+         * bottom row, so centring the text on it (y-3) runs 3 rows past the
+         * band and the footer — which clears from FOOT_Y — erases the lower
+         * half of the digits. Clamping pulls that one label above its tick
+         * instead of letting it be clipped. */
+        int ty = y - 3;
+        if (ty + 8 > WF_Y0 + WF_H) ty = WF_Y0 + WF_H - 8;
+        text_r(PLOT_X0 - 7, ty, 1, COL_DIM, tb);
     }
 }
 
