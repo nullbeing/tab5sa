@@ -26,9 +26,23 @@ static void audio_out_task(void *arg)
 {
     (void)arg;
     static uint8_t buf[4096];
+    /* Zero-filled: used to keep the I2S TX fed when nothing is playing. */
+    static const uint8_t silence[4096];
+
     while (1) {
-        size_t n = xStreamBufferReceive(s_sb, buf, sizeof buf, portMAX_DELAY);
-        if (n) esp_codec_dev_write(s_codec, buf, n);
+        /* Bounded wait, not portMAX_DELAY: the producer (the demod task) stops
+         * sending the moment the receiver is stopped or the dongle is absent.
+         * With an infinite wait this task would then block forever, the I2S TX
+         * DMA would underrun, and the codec would keep replaying its last
+         * buffer — which the speaker renders as continuous noise. */
+        size_t n = xStreamBufferReceive(s_sb, buf, sizeof buf, pdMS_TO_TICKS(20));
+        if (n) {
+            esp_codec_dev_write(s_codec, buf, n);
+        } else {
+            /* ~21 ms of silence at 48 kHz stereo 16-bit. Writing it also paces
+             * this loop, since the codec write blocks on the DMA. */
+            esp_codec_dev_write(s_codec, silence, sizeof silence);
+        }
     }
 }
 
