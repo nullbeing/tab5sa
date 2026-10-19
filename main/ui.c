@@ -65,6 +65,28 @@ static const char *TAG = "ui";
  * screen would otherwise stay wrong with no way back. */
 #define MODE_LONG_POLLS 80
 
+/* Scan transport, in the dead space between the frequency readout and the mode
+ * badge (the readout ends near x=314, the badge starts at 584).
+ *
+ * Three buttons: play/stop, step back, step forward. They are deliberately not
+ * a full transport bar — a spectrum analyzer has nothing to "rewind", so
+ * back/forward mean "hunt for the next signal in that direction". */
+#define SCAN_BTN_Y0   15
+#define SCAN_BTN_Y1   49
+#define SCAN_BTN_H    (SCAN_BTN_Y1 - SCAN_BTN_Y0)
+#define SCAN_BTN_W    72
+#define SCAN_BTN_GAP  12
+#define SCAN_BTN_X0   328
+#define SCAN_BTN_N    3
+
+/* Scan behaviour. Steps are small relative to the 1.15 MHz view so a signal is
+ * not skipped between steps; the tick rate gives the tuner and the demodulator
+ * time to settle before the level is judged. */
+#define SCAN_STEP_HZ   100000 /* 100 kHz per step                      */
+#define SCAN_TICK_US   100000 /* 10 steps/s                            */
+#define SCAN_HOLD_DB     6.0f /* this far above the noise floor = found */
+#define SEEK_MAX_STEPS   400  /* give up after ~40 MHz                 */
+
 /* Volume: a vertical 8-step bar in the right-hand gutter beside the waterfall.
  * That strip was dead space (the waterfall only paints PLOT_W columns, and the
  * dBm labels stop at the spectrum's bottom edge), so the control costs no
@@ -127,7 +149,7 @@ static const char *TAG = "ui";
 /* Tap target over the 7-segment readout (it occupies x 8..~320, y 15..48).
  * Kept clear of the mode badge on the right so the two never fight. */
 #define FREQ_BOX_X0   4
-#define FREQ_BOX_X1 340
+#define FREQ_BOX_X1 322   /* the readout ends near x=314; keep clear of the scan buttons at 328 */
 #define FREQ_BOX_Y0   8
 #define FREQ_BOX_Y1  52
 
@@ -173,6 +195,17 @@ static volatile bool s_redraw; /* set by ui_set_freq()/ui_set_mode()  */
  * into this landscape buffer by the ui_task loop. */
 static bool s_mode_hot;   /* finger is currently on the WFM/NFM badge     */
 static int  s_mode_hold;  /* polls the badge has been held               */
+static int  s_scan_hot;   /* scan button under the finger, -1 = none     */
+
+/* Scan transport state. Both arrows share one model:
+ *   s_scan_dir  0 = idle, -1 = hunting down, +1 = hunting up
+ *   s_scan_left steps remaining before the hunt gives up
+ * The middle button is NOT part of this: it latches the demodulator mute and
+ * has nothing to do with where the receiver is tuned. A manual tune cancels a
+ * hunt, so the user can always take back control. */
+static int  s_scan_dir;
+static int  s_scan_left;
+static int64_t s_scan_next;
 static bool s_vol_hot;    /* finger is currently on the volume bar       */
 
 /* Screen orientation. Driven by the IMU: when the device is turned upside down
@@ -520,6 +553,86 @@ static void draw_battery(void)
 #define PLOT_W   574
 #define PLOT_X1  (PLOT_X0 + PLOT_W)
 
+/* ---- scan transport ------------------------------------------------------ */
+/*
+ * Three buttons in the dead space between the frequency readout (ends near
+ * x=314) and the mode badge (starts at 584).
+ *
+ * They are not a media transport: a spectrum analyzer has nothing to rewind.
+ * Instead, left to right:
+ *   [0] seek down    hunt downward and park on the first signal found
+ *   [1] play / stop  latch the demodulated audio off/on (does NOT retune)
+ *   [2] seek up      same as [0], upward
+ *
+ * Seek is what the arrows are for: with 1.15 MHz on screen, nudging by one
+ * step is already covered by dragging, so hunting is the useful behaviour.
+ * The middle button is deliberately not a sweep — the arrows own frequency, so
+ * this one owns audio, and neither has to know what the other is doing.
+ */
+static void scan_btn_x(int idx, int *x)
+{
+    *x = SCAN_BTN_X0 + idx * (SCAN_BTN_W + SCAN_BTN_GAP);
+}
+
+/* Button index at (lx,ly), or -1. */
+static int scan_hit(int lx, int ly)
+{
+    if (ly < SCAN_BTN_Y0 || ly >= SCAN_BTN_Y1) return -1;
+    for (int i = 0; i < SCAN_BTN_N; i++) {
+        int x;
+        scan_btn_x(i, &x);
+        if (lx >= x && lx < x + SCAN_BTN_W) return i;
+    }
+    return -1;
+}
+
+static void draw_scan_buttons(void)
+{
+    /* Left-to-right: hunt down, play/stop decode, hunt up. The middle button
+     * does not move the receiver at all — it latches the demodulator mute, so
+     * the arrows are the only things that change frequency. */
+    bool playing = !dsp_get_mute();
+
+    for (int i = 0; i < SCAN_BTN_N; i++) {
+        int x;
+        scan_btn_x(i, &x);
+
+        bool hot = (s_scan_hot == i);
+        /* Light whichever button owns the current state, so the panel says
+         * what is happening without a separate indicator. */
+        bool active = (i == 0) ? (s_scan_dir < 0)
+                    : (i == 1) ? playing
+                               : (s_scan_dir > 0);
+
+        uint16_t fg = hot ? COL_BG : (active ? COL_CURSOR : COL_DIM);
+        rect(x, SCAN_BTN_Y0, SCAN_BTN_W, SCAN_BTN_H,
+             hot ? COL_CURSOR : RGB565(0, 18, 10));
+
+        int cx = x + SCAN_BTN_W / 2;
+        int cy = (SCAN_BTN_Y0 + SCAN_BTN_Y1) / 2;
+
+        if (i == 0) {
+            int px[3] = { cx + 6, cx - 6, cx + 6 }; /* left */
+            int py[3] = { cy - 8, cy,      cy + 8 };
+            poly(px, py, 3, fg);
+        } else if (i == 1) {
+            /* Show the action the press will perform: a stop bar while audio is
+             * running, a play triangle while it is muted. */
+            if (playing) {
+                rect(cx - 7, cy - 7, 14, 14, fg); /* stop */
+            } else {
+                int px[3] = { cx - 6, cx + 8, cx - 6 }; /* play */
+                int py[3] = { cy - 8, cy,      cy + 8 };
+                poly(px, py, 3, fg);
+            }
+        } else {
+            int px[3] = { cx - 6, cx + 6, cx - 6 }; /* right */
+            int py[3] = { cy - 8, cy,      cy + 8 };
+            poly(px, py, 3, fg);
+        }
+    }
+}
+
 static void draw_header(void)
 {
     sdr_stats_t st;
@@ -583,6 +696,8 @@ static void draw_header(void)
         }
         text_c((MODE_BOX_X0 + MODE_BOX_X1) / 2, y + 4, 2, fg, lab);
     }
+
+    draw_scan_buttons();
 
     /* --- row 3: parameter strip ------------------------------------------ */
     int yy = 50;
@@ -1039,6 +1154,58 @@ static void toggle_mode(void)
     s_redraw = true;
 }
 
+/* ---- scan state machine -------------------------------------------------- */
+
+static void scan_stop(void)
+{
+    s_scan_dir = 0;
+    s_scan_left = 0;
+    s_redraw = true;
+}
+
+static void scan_start(int dir)
+{
+    s_scan_dir = dir;
+    s_scan_left = SEEK_MAX_STEPS;
+    s_scan_next = esp_timer_get_time(); /* step on the next tick */
+    s_redraw = true;
+}
+
+/*
+ * Advance the hunt. Called from the UI loop; does nothing unless an arrow is
+ * active and its tick interval has elapsed.
+ *
+ * The step is slow on purpose (10 per second): the tuner needs several control
+ * transfers to retune and the demodulator has to settle before the level at the
+ * new frequency means anything. Stepping faster would judge stale data.
+ */
+static void scan_tick(void)
+{
+    if (s_scan_dir == 0) return;
+
+    int64_t now = esp_timer_get_time();
+    if (now < s_scan_next) return;
+
+    /* Judge where we are BEFORE moving on: the tick interval is what gives the
+     * reading time to become valid. */
+    if (dsp_signal_db() > dsp_noise_floor_db() + SCAN_HOLD_DB) {
+        scan_stop(); /* found something: park here */
+        return;
+    }
+
+    if (--s_scan_left <= 0) {
+        scan_stop(); /* reached the end of the hunt without finding anything */
+        return;
+    }
+
+    int64_t want = (int64_t)s_center + (int64_t)s_scan_dir * SCAN_STEP_HZ;
+    if (want > (int64_t)FREQ_MAX) { scan_stop(); return; } /* band edge */
+    if (want < (int64_t)FREQ_MIN) { scan_stop(); return; }
+
+    tune_live(want);
+    s_scan_next = now + SCAN_TICK_US;
+}
+
 /* Read the panel and apply gestures. Returns true when the screen needs a
  * repaint. */
 static bool handle_touch(void)
@@ -1123,9 +1290,29 @@ static bool handle_touch(void)
             changed = true;
         }
         if (s_vol_hot)  { s_vol_hot  = false; changed = true; }
+        if (s_scan_hot >= 0) { s_scan_hot = -1; changed = true; }
     }
 
-    if (edge && lx >= MODE_BOX_X0 && lx < MODE_BOX_X1 &&
+    if (edge && scan_hit(lx, ly) >= 0) {
+        /* Scan transport. Acted on press rather than release: these are
+         * latched actions (start/stop), not a value the finger is dragging, so
+         * there is nothing to fine-tune by sliding. */
+        int b = scan_hit(lx, ly);
+        if (b == 1) {
+            /* Play/stop decode: latches the demodulator mute, independent of
+             * where the receiver is tuned and of the squelch. */
+            dsp_set_mute(!dsp_get_mute());
+            s_redraw = true;
+        } else {
+            /* Arrows hunt in one direction and park on the first signal. */
+            int dir = (b == 0) ? -1 : +1;
+            if (s_scan_dir == dir) scan_stop();
+            else                   scan_start(dir);
+        }
+        s_scan_hot = b;
+        dragging = false;
+        changed = true;
+    } else if (edge && lx >= MODE_BOX_X0 && lx < MODE_BOX_X1 &&
         ly >= MODE_BOX_Y0 && ly < MODE_BOX_Y1) {
         /* Mode badge: act on RELEASE, so a hold can mean something different
          * from a tap (see the release branch). */
@@ -1157,6 +1344,7 @@ static bool handle_touch(void)
     } else if (pressed && ly >= SPEC_Y0 && ly < WF_Y0 + WF_H) {
         /* Spectrum or waterfall: drag to slide the frequency, or tap to jump. */
         if (edge) {
+            scan_stop(); /* a manual tune always takes back control */
             dragging = true;
             moved = false;
             drag_x0 = lx;
@@ -1269,6 +1457,11 @@ static void ui_task(void *arg)
             draw_footer();
             present();
         }
+
+        /* Scan transport. Self-gating on a wall-clock interval: it steps at
+         * 10 Hz regardless of how fast this loop runs, so the tuner and the
+         * demodulator get time to settle between steps. */
+        scan_tick();
 
         const float *spec = dsp_spectrum();
         bool newspec = spec && spec != last;
