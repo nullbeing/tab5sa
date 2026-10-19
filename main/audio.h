@@ -13,9 +13,10 @@ extern "C" {
 
 #define AUDIO_SAMPLE_RATE 48000
 
-/* Volume applied at boot, before the user touches the UI. Kept low so an
- * unattended power-on isn't at full tilt; the UI seeds its own slider from it. */
-#define AUDIO_VOL_DEFAULT 10
+/* Volume applied at boot. The Tab5's speaker is tiny and low-output, so the
+ * default is full scale — anything less is barely audible in a quiet room.
+ * The UI seeds its 8-step level from this (see VOL_SEGS). */
+#define AUDIO_VOL_DEFAULT 100
 
 /* Bring up the ES8388 codec and start the output task. */
 void audio_init(void);

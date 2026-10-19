@@ -22,7 +22,7 @@
 #include "audio.h"
 #include "ui.h"
 
-static const char *TAG = "tab5-sdr";
+static const char *TAG = "tab5sa";
 
 /* Tab5 panel: 720x1280, RGB565 (see bsp_tab5.c). */
 #define PANEL_W 720
@@ -51,14 +51,6 @@ static void draw_test_pattern(void)
     bsp_tab5_display_flush(0);
 }
 
-static void fill_screen(uint16_t color)
-{
-    uint16_t *f = fb();
-    if (!f) return;
-    for (size_t i = 0; i < (size_t)PANEL_W * PANEL_H; i++) f[i] = color;
-    bsp_tab5_display_flush(0);
-}
-
 void app_main(void)
 {
     ESP_LOGI(TAG, "Tab5-SDR boot — free heap %" PRIu32 ", PSRAM %u",
@@ -73,30 +65,69 @@ void app_main(void)
     bsp_tab5_display_set_brightness(80);
     draw_test_pattern();
 
-    /* USB-A 5V VBUS is off by default — power the dongle, then enumerate. */
+    /* USB-A 5V VBUS is off by default — power the dongle, then enumerate.
+     * The dongle shares this port with the flashing/serial link, so it is
+     * normally ABSENT. sdr_start() is non-blocking: it brings up the USB host
+     * and a supervisor task that keeps looking for a dongle in the background,
+     * and streams whenever one appears. The UI comes up either way. */
     bsp_tab5_set_usb_host_power(true);
     vTaskDelay(pdMS_TO_TICKS(300));
 
-    fill_screen(RGB565(0, 0, 200)); /* blue: searching */
-    sdr_open();                     /* blocks until a dongle is opened */
-    fill_screen(RGB565(0, 120, 0)); /* green: opened */
+    sdr_start(SDR_DEFAULT_CENTER_FREQ, SDR_DEFAULT_SAMPLE_RATE);
 
-    if (!sdr_stream_start(SDR_DEFAULT_CENTER_FREQ, SDR_DEFAULT_SAMPLE_RATE)) {
-        fill_screen(RGB565(220, 0, 0)); /* red: stream failed */
-        return;
-    }
-
-    /* Speaker up, then demod + landscape UI take over the screen. */
+    /* Speaker up, then demod + spectrum console take over the screen. */
     audio_init();
     dsp_start();
     ui_start();
 
-    /* Heartbeat: confirm the stream stays drop-free under the DSP load. */
+    /* Heartbeat: produced= is what proves IQ is actually arriving (dropped=
+     * stays 0 both when the consumer keeps up AND when nothing is produced).
+     * The battery line proves the INA226 answered and charging is enabled. */
+    int hb = 0;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(5000));
         sdr_stats_t st;
         sdr_get_stats(&st);
-        ESP_LOGI(TAG, "%.3f MHz, dropped=%llu bytes total",
-                 st.center_freq / 1e6, (unsigned long long)st.dropped_bytes);
+        hb++;
+
+        bsp_tab5_battery_t bat;
+        bsp_tab5_battery_read(&bat);
+        /* Orientation is appended to the heartbeat rather than logged once at
+         * boot: the USB-serial port is shared with flashing, so early boot lines
+         * are easy to miss. Raw mg values are printed so a wrong axis choice can
+         * be diagnosed from a single capture. */
+        bsp_tab5_orient_t ori;
+        bsp_tab5_orientation_get(&ori);
+        const char *ori_s = !ori.present ? "no IMU"
+                          : ori.flipped ? "FLIP" : "norm";
+        /* Raw counts and the live range are printed next to the converted mg
+         * values so the two can be cross-checked: at rest the magnitude must
+         * be ~1000 mg, which is what confirms the range register and the
+         * assumed sensitivity agree. Same numbers are needed to work out which
+         * axis is "up" on this board. */
+        if (bat.present) {
+            ESP_LOGI(TAG, "%s, %.3f MHz, produced=%llu dropped=%llu | bat %d.%02dV %+.0fmA %d%% %s%s | imu %s r%u %+d/%+d/%+d mg (raw %+d/%+d/%+d)",
+                     st.present ? st.tuner : "no dongle",
+                     st.center_freq / 1e6, (unsigned long long)st.produced_bytes,
+                     (unsigned long long)st.dropped_bytes,
+                     (int)(bat.mv / 1000), (int)((bat.mv % 1000) / 10),
+                     bat.ma, bat.percent,
+                     bat.charging ? "CHG" : "dischg",
+                     bsp_tab5_charge_enabled() ? "" : " (CHG_EN off!)",
+                     ori_s, ori.range, ori.ax, ori.ay, ori.az,
+                     ori.rx, ori.ry, ori.rz);
+        } else {
+            ESP_LOGI(TAG, "%s, %.3f MHz, produced=%llu dropped=%llu | no INA226, chg_en=%d | imu %s r%u %+d/%+d/%+d mg (raw %+d/%+d/%+d)",
+                     st.present ? st.tuner : "no dongle",
+                     st.center_freq / 1e6, (unsigned long long)st.produced_bytes,
+                     (unsigned long long)st.dropped_bytes,
+                     (int)bsp_tab5_charge_enabled(),
+                     ori_s, ori.range, ori.ax, ori.ay, ori.az,
+                     ori.rx, ori.ry, ori.rz);
+        }
+        /* Raw register dump periodically: enough to diagnose a stuck
+         * conversion or a charge-enable that did not land, without flooding
+         * the console. */
+        if (hb % 6 == 0) bsp_tab5_battery_dump();
     }
 }

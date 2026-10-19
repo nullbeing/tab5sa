@@ -1,29 +1,37 @@
 /*
- * ui.c — landscape touch UI for Tab5-SDR.
+ * ui.c — instrument-style spectrum console for Tab5-SDR.
  *
- * Rendered into a 640x360 landscape RGB565 buffer (LBUF); the P4 PPA scales x2
- * and rotates 90° onto the 720x1280 panel (half-res keeps the PPA cheap).
- * Touch maps back: lx = (1280 - panel_y)/2,  ly = panel_x/2.
+ * Display-only build (no touch): the screen mirrors a classic SDR analyzer
+ * head — a dense status header with a large 7-segment frequency readout, a
+ * green filled spectrum with a 10 dB graticule labelled in dBm on both edges,
+ * a frequency ruler, and a rainbow waterfall with a time axis.
  *
- * Controls: drag spectrum/waterfall to scan fast; [-1][-.1][+.1][+1] tune;
- * WFM/NFM mode toggle; WX/FDNY/EMS bookmark cyclers; volume +/- ; squelch +/-.
+ * Rendering goes into a 640x360 RGB565 buffer in PSRAM; the P4 PPA scales it
+ * x2 and rotates 90° onto the 720x1280 panel (half-res keeps the PPA cheap).
+ *
+ * Levels are uncalibrated: dsp.c reports dB relative to its own FFT scale, so
+ * the window is anchored on each frame's noise floor and the dBm labels are
+ * that window shifted to read like a calibrated analyzer.
+ * Tuning input is not wired up yet — ui_set_freq()/ui_set_mode() are the hooks
+ * a future encoder, keypad or serial console would call.
  */
 #include "ui.h"
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "driver/ppa.h"
 
 #include "bsp_tab5.h"
 #include "sdr.h"
 #include "dsp.h"
 #include "audio.h"
-#include "bookmarks.h"
 
 static const char *TAG = "ui";
 
@@ -33,59 +41,151 @@ static const char *TAG = "ui";
 #define PANEL_H 1280
 #define SCALE 2
 
-#define SPEC_Y0 42
-#define SPEC_H  66
-#define WF_Y0   (SPEC_Y0 + SPEC_H + 4) /* 112 */
-#define WF_H    98                     /* 112..210 */
-#define CTRL_Y0 214
+/* ---- layout (single column, top to bottom) ------------------------------- */
+#define HDR_H    62    /* status header          0..61                       */
+#define SPEC_Y0  64    /* spectrum plot         64..195                      */
+#define SPEC_H   132
+#define RULER_Y  198   /* ruler ticks + labels 198..210                      */
+#define WF_Y0    214   /* waterfall            214..341                      */
+#define WF_H     128
+#define FOOT_Y   343   /* status footer        343..359                      */
+#define GRID_DIV 8     /* 8 x 10 dB rows across the plot                     */
 
-#define DB_MIN 44.0f
-#define DB_MAX 88.0f
+/* Touch target for the WFM/NFM badge. Bigger than the glyphs so it is
+ * comfortably tappable on the physical panel (these are logical pixels; the
+ * PPA scales them 2x on the way to the glass). */
+#define MODE_BOX_X0 584
+#define MODE_BOX_Y0  14
+#define MODE_BOX_X1 638
+#define MODE_BOX_Y1  50
+
+/* Volume: a vertical 8-step bar in the right-hand gutter beside the waterfall.
+ * That strip was dead space (the waterfall only paints PLOT_W columns, and the
+ * dBm labels stop at the spectrum's bottom edge), so the control costs no
+ * layout at all. Discrete steps rather than a continuous slider: coarse,
+ * glanceable, and easy to hit with a finger.
+ *
+ * VOL_ZONE_X0 equals PLOT_X1 (34 + 574 = 608). */
+#define VOL_SEGS    8
+#define VOL_ZONE_X0 608            /* whole gutter is the touch target */
+#define VOL_ZONE_X1 LW
+#define VOL_BAR_X0  612
+#define VOL_BAR_X1  634
+#define VOL_BAR_TOP (WF_Y0 + 16)   /* leaves a row for the level digit */
+#define VOL_BAR_BOT (WF_Y0 + WF_H - 2)
+
+/* ---- level mapping ------------------------------------------------------- */
+/* dsp_spectrum() already returns NOMINAL dBm — dsp.c applies its own offset when
+ * a frame is published — so everything here works in that unit directly. DB_SPAN
+ * is the only level knob that belongs to the UI: how many dB fit vertically.
+ *
+ * Do not mix this with dsp_signal_db(), which is demodulated IF power in raw dB
+ * on a completely different scale.
+ *
+ * The plot normalises on the frame's own noise floor, so the trace stays on
+ * screen whatever the dongle's gain is; the dBm labels are then just that window
+ * shifted to look like a calibrated analyzer. */
+#define DB_SPAN          80.0f   /* dB across the spectrum graticule        */
+/* The waterfall uses a much narrower range than the spectrum graticule: a
+ * 80 dB waterfall is almost black because everything real sits in the top
+ * 20 dB. WF_SPAN + WF_BASE gives noise a visible blue base and 20 dB of signal
+ * a bright green/white core, like a hardware analyzer. */
+#define WF_SPAN          45.0f   /* dB from waterfall floor to ceiling      */
+#define WF_BASE           0.16f  /* colour index of the noise floor         */
+#define REF_SLEW          0.12f  /* ref-level follow rate (per frame)       */
+#define PEAK_DECAY        0.35f  /* peak-hold fall, dB per frame            */
 
 #define FREQ_MIN 24000000u
 #define FREQ_MAX 1766000000u
 
-/* Drag tuning: full canvas width ≈ 100 MHz (fast band scanning). */
-#define DRAG_HZ_PER_PX (100000000 / LW)
+/* ---- numeric keypad (tap the frequency readout to open) ------------------ */
+/* Values are entered in MHz with a decimal point ("121.5"), which is how
+ * frequencies are actually quoted; typing nine raw Hz digits would be slow and
+ * easy to get wrong by a factor of ten. The panel is modal: while it is open it
+ * swallows every touch and is painted last, so it sits above the live spectrum. */
+#define KP_X0      148
+#define KP_Y0       14
+#define KP_W       344
+#define KP_H       332
+#define KP_PAD       8
+#define KP_KEY_W   104
+#define KP_KEY_H    48
+#define KP_GAP       8
+#define KP_VAL_Y   (KP_Y0 + KP_PAD)               /* value readout top */
+#define KP_VAL_H    40
+#define KP_GRID_Y  (KP_VAL_Y + KP_VAL_H + KP_GAP) /* first key row     */
+#define KP_BTN_Y   (KP_GRID_Y + 4 * (KP_KEY_H + KP_GAP))
+#define KP_BTN_H    44
+#define KP_BTN_W   160
 
-#define SQ_OFFSET 64.0f
-#define SQ_STEP   5
-#define VOL_STEP  5
+/* Tap target over the 7-segment readout (it occupies x 8..~320, y 15..48).
+ * Kept clear of the mode badge on the right so the two never fight. */
+#define FREQ_BOX_X0   4
+#define FREQ_BOX_X1 340
+#define FREQ_BOX_Y0   8
+#define FREQ_BOX_Y1  52
 
+/* ---- theme --------------------------------------------------------------- */
 #define RGB565(r, g, b) \
     ((uint16_t)(((((r) >> 3) & 0x1F) << 11) | ((((g) >> 2) & 0x3F) << 5) | (((b) >> 3) & 0x1F)))
-#define COL_BG     RGB565(8, 12, 28)
-#define COL_PANEL  RGB565(18, 22, 40)
-#define COL_TEXT   RGB565(210, 220, 240)
-#define COL_ACCENT RGB565(0, 220, 120)
-#define COL_LINE   RGB565(255, 210, 0)
-#define COL_BTN    RGB565(40, 60, 110)
-#define COL_BTN_HI RGB565(80, 110, 180)
-#define COL_TRACK  RGB565(50, 56, 78)
+#define COL_BG      RGB565(0, 0, 0)
+#define COL_GRID    RGB565(0, 64, 0)
+#define COL_GRIDV   RGB565(0, 44, 0)
+#define COL_FILL    RGB565(0, 74, 18)    /* body under the spectrum curve   */
+#define COL_TRACE   RGB565(0, 255, 64)   /* bright curve                    */
+#define COL_PEAK    RGB565(0, 120, 84)   /* peak hold                       */
+#define COL_TEXT    RGB565(150, 178, 150)
+#define COL_DIM     RGB565(96, 118, 96)
+#define COL_GREEN   RGB565(0, 235, 96)
+#define COL_YELLOW  RGB565(240, 215, 70)
+#define COL_CYAN    RGB565(90, 215, 235)
+#define COL_MAGENTA RGB565(235, 90, 215)
+#define COL_RED     RGB565(240, 70, 70)
+#define COL_WHITE   RGB565(238, 242, 238)
+#define COL_CURSOR  RGB565(255, 190, 60)
+#define COL_SEG_OFF RGB565(26, 32, 27) /* unlit 7-seg segment (VFD ghost)  */
 
 static uint16_t *LBUF;
 static ppa_client_handle_t s_ppa;
 static int s_fb_index;
+static uint16_t s_wlut[256]; /* waterfall LUT: black -> magenta -> cyan -> white */
 
 static uint32_t s_center;
-static int s_volume = AUDIO_VOL_DEFAULT;
-static int s_squelch = -60;
-static int s_nfm = 0;
-static const char *s_label = "WFM broadcast";
-static int s_wx = -1, s_fdny = -1, s_ems = -1; /* per-category cursor */
+static int s_vol_level = 8; /* 1..VOL_SEGS (8 discrete steps); boot at max */
+static int s_mode;   /* DSP_MODE_* currently selected                 */
+static int s_fps;
+static bsp_tab5_battery_t s_bat; /* refreshed every ~2 s from the INA226 */
+static float s_ref_db = -30.0f; /* top of the dB window (nominal dBm) */
+static int s_ref_shown = -1000; /* ref value currently painted in the header */
+static bool s_ref_init;
+static float s_nf_dbm = -110.0f; /* frame noise floor (nominal dBm)     */
+static float s_peak_dbm;         /* frame peak, for the header readout  */
+static float s_peak[LW];  /* peak-hold level per column (dBm)       */
+static volatile bool s_redraw; /* set by ui_set_freq()/ui_set_mode()  */
 
-/* Tuning step (Hz) applied by the [-]/[+] buttons; STEP button cycles it. */
-static const uint32_t STEPS[] = {1000, 5000, 6250, 12500, 25000, 100000, 1000000};
-#define N_STEPS ((int)(sizeof(STEPS) / sizeof(STEPS[0])))
-static int s_step_i = 4; /* default 25 kHz */
+/* Touch state. The panel reports portrait coordinates, which are mapped back
+ * into this landscape buffer by the ui_task loop. */
+static bool s_mode_hot;   /* finger is currently on the WFM/NFM badge     */
+static bool s_vol_hot;    /* finger is currently on the volume bar       */
 
-static void step_label(char *out, size_t n)
-{
-    uint32_t s = STEPS[s_step_i];
-    if (s >= 1000000) snprintf(out, n, "%uM", (unsigned)(s / 1000000));
-    else if (s % 1000 == 0) snprintf(out, n, "%uk", (unsigned)(s / 1000));
-    else snprintf(out, n, "%u.%02uk", (unsigned)(s / 1000), (unsigned)((s % 1000) / 10));
-}
+/* Screen orientation. Driven by the IMU: when the device is turned upside down
+ * the PPA rotation switches from 90° to 270° and the touch mapping mirrors to
+ * match (see present() and handle_touch()). */
+static bool s_flipped;
+
+/* Numeric keypad state. */
+static bool s_kp_open;
+static char s_kp_buf[24];  /* digits typed, e.g. "121.5"                  */
+static int  s_kp_len;
+static int  s_kp_hot = -1; /* key index under the finger, for feedback     */
+static bool s_kp_closed;   /* overlay just closed: repaint underneath      */
+
+static const char *const KP_LABELS[12] = {
+    "1", "2", "3",
+    "4", "5", "6",
+    "7", "8", "9",
+    ".", "0", "DEL",
+};
 
 /* ---- primitives ---------------------------------------------------------- */
 
@@ -95,47 +195,120 @@ static void rect(int x, int y, int w, int h, uint16_t c)
     if (y < 0) { h += y; y = 0; }
     if (x + w > LW) w = LW - x;
     if (y + h > LH) h = LH - y;
+    if (w <= 0 || h <= 0) return;
     for (int j = 0; j < h; j++) {
         uint16_t *row = LBUF + (size_t)(y + j) * LW + x;
         for (int i = 0; i < w; i++) row[i] = c;
     }
 }
 
+static void hline(int x, int y, int w, uint16_t c) { rect(x, y, w, 1, c); }
+static void vline(int x, int y, int h, uint16_t c) { rect(x, y, 1, h, c); }
+
+/* ---- 5x7 bitmap font, full printable ASCII ------------------------------- */
+
+static const uint8_t FONT[][7] = {
+    /* ' ' */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+    /* '!' */ {0x04,0x04,0x04,0x04,0x04,0x00,0x04},
+    /* '"' */ {0x0A,0x0A,0x00,0x00,0x00,0x00,0x00},
+    /* '#' */ {0x0A,0x1F,0x0A,0x0A,0x1F,0x0A,0x00},
+    /* '$' */ {0x04,0x0F,0x14,0x0E,0x05,0x1E,0x04},
+    /* '%' */ {0x11,0x12,0x04,0x08,0x15,0x12,0x11},
+    /* '&' */ {0x0C,0x12,0x14,0x08,0x15,0x12,0x0D},
+    /* ''' */ {0x04,0x04,0x00,0x00,0x00,0x00,0x00},
+    /* '(' */ {0x02,0x04,0x08,0x08,0x08,0x04,0x02},
+    /* ')' */ {0x08,0x04,0x02,0x02,0x02,0x04,0x08},
+    /* '*' */ {0x04,0x15,0x0E,0x1F,0x0E,0x15,0x04},
+    /* '+' */ {0x00,0x04,0x04,0x1F,0x04,0x04,0x00},
+    /* ',' */ {0x00,0x00,0x00,0x00,0x0C,0x04,0x08},
+    /* '-' */ {0x00,0x00,0x00,0x1F,0x00,0x00,0x00},
+    /* '.' */ {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C},
+    /* '/' */ {0x01,0x01,0x02,0x04,0x08,0x10,0x10},
+    /* '0' */ {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E},
+    /* '1' */ {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
+    /* '2' */ {0x0E,0x11,0x01,0x06,0x08,0x10,0x1F},
+    /* '3' */ {0x0E,0x11,0x01,0x06,0x01,0x11,0x0E},
+    /* '4' */ {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02},
+    /* '5' */ {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
+    /* '6' */ {0x0E,0x11,0x10,0x1E,0x11,0x11,0x0E},
+    /* '7' */ {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},
+    /* '8' */ {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E},
+    /* '9' */ {0x0E,0x11,0x11,0x0F,0x01,0x11,0x0E},
+    /* ':' */ {0x00,0x0C,0x0C,0x00,0x0C,0x0C,0x00},
+    /* ';' */ {0x00,0x04,0x04,0x00,0x04,0x04,0x08},
+    /* '<' */ {0x02,0x04,0x08,0x10,0x08,0x04,0x02},
+    /* '=' */ {0x00,0x00,0x1F,0x00,0x1F,0x00,0x00},
+    /* '>' */ {0x08,0x04,0x02,0x01,0x02,0x04,0x08},
+    /* '?' */ {0x0E,0x11,0x01,0x06,0x04,0x00,0x04},
+    /* '@' */ {0x0E,0x11,0x15,0x15,0x17,0x10,0x0E},
+    /* 'A' */ {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11},
+    /* 'B' */ {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E},
+    /* 'C' */ {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E},
+    /* 'D' */ {0x1C,0x12,0x11,0x11,0x11,0x12,0x1C},
+    /* 'E' */ {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F},
+    /* 'F' */ {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10},
+    /* 'G' */ {0x0E,0x11,0x10,0x17,0x11,0x11,0x0F},
+    /* 'H' */ {0x11,0x11,0x11,0x1F,0x11,0x11,0x11},
+    /* 'I' */ {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E},
+    /* 'J' */ {0x07,0x02,0x02,0x02,0x02,0x12,0x0C},
+    /* 'K' */ {0x11,0x12,0x14,0x18,0x14,0x12,0x11},
+    /* 'L' */ {0x10,0x10,0x10,0x10,0x10,0x10,0x1F},
+    /* 'M' */ {0x11,0x1B,0x15,0x15,0x11,0x11,0x11},
+    /* 'N' */ {0x11,0x19,0x15,0x13,0x11,0x11,0x11},
+    /* 'O' */ {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E},
+    /* 'P' */ {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},
+    /* 'Q' */ {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D},
+    /* 'R' */ {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11},
+    /* 'S' */ {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E},
+    /* 'T' */ {0x1F,0x04,0x04,0x04,0x04,0x04,0x04},
+    /* 'U' */ {0x11,0x11,0x11,0x11,0x11,0x11,0x0E},
+    /* 'V' */ {0x11,0x11,0x11,0x11,0x11,0x0A,0x04},
+    /* 'W' */ {0x11,0x11,0x11,0x15,0x15,0x1B,0x11},
+    /* 'X' */ {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11},
+    /* 'Y' */ {0x11,0x11,0x0A,0x04,0x04,0x04,0x04},
+    /* 'Z' */ {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F},
+    /* '[' */ {0x0E,0x08,0x08,0x08,0x08,0x08,0x0E},
+    /* '\' */ {0x10,0x10,0x08,0x04,0x02,0x01,0x01},
+    /* ']' */ {0x0E,0x02,0x02,0x02,0x02,0x02,0x0E},
+    /* '^' */ {0x04,0x0A,0x11,0x00,0x00,0x00,0x00},
+    /* '_' */ {0x00,0x00,0x00,0x00,0x00,0x00,0x1F},
+    /* '`' */ {0x08,0x04,0x02,0x00,0x00,0x00,0x00},
+    /* 'a' */ {0x00,0x00,0x0E,0x01,0x0F,0x11,0x0F},
+    /* 'b' */ {0x10,0x10,0x1E,0x11,0x11,0x11,0x1E},
+    /* 'c' */ {0x00,0x00,0x0E,0x11,0x10,0x11,0x0E},
+    /* 'd' */ {0x01,0x01,0x0F,0x11,0x11,0x11,0x0F},
+    /* 'e' */ {0x00,0x00,0x0E,0x11,0x1F,0x10,0x0E},
+    /* 'f' */ {0x06,0x09,0x08,0x1C,0x08,0x08,0x08},
+    /* 'g' */ {0x00,0x00,0x0F,0x11,0x11,0x0F,0x1E},
+    /* 'h' */ {0x10,0x10,0x1E,0x12,0x12,0x12,0x12},
+    /* 'i' */ {0x04,0x00,0x04,0x04,0x04,0x04,0x04},
+    /* 'j' */ {0x04,0x00,0x04,0x04,0x04,0x14,0x0C},
+    /* 'k' */ {0x10,0x10,0x12,0x14,0x18,0x14,0x12},
+    /* 'l' */ {0x0C,0x04,0x04,0x04,0x04,0x04,0x0E},
+    /* 'm' */ {0x00,0x00,0x1E,0x15,0x15,0x11,0x11},
+    /* 'n' */ {0x00,0x00,0x1E,0x12,0x12,0x12,0x12},
+    /* 'o' */ {0x00,0x00,0x0E,0x11,0x11,0x11,0x0E},
+    /* 'p' */ {0x1F,0x11,0x11,0x1F,0x10,0x10,0x10},
+    /* 'q' */ {0x0F,0x11,0x11,0x0F,0x01,0x01,0x01},
+    /* 'r' */ {0x00,0x00,0x16,0x19,0x10,0x10,0x10},
+    /* 's' */ {0x00,0x00,0x0F,0x10,0x0E,0x01,0x1E},
+    /* 't' */ {0x08,0x08,0x1C,0x08,0x08,0x09,0x0E},
+    /* 'u' */ {0x00,0x00,0x12,0x12,0x12,0x13,0x0D},
+    /* 'v' */ {0x00,0x00,0x11,0x11,0x11,0x0A,0x04},
+    /* 'w' */ {0x00,0x00,0x11,0x15,0x15,0x1B,0x0A},
+    /* 'x' */ {0x00,0x00,0x11,0x0A,0x04,0x0A,0x11},
+    /* 'y' */ {0x00,0x00,0x11,0x11,0x0F,0x01,0x1E},
+    /* 'z' */ {0x00,0x00,0x1F,0x02,0x04,0x08,0x1F},
+    /* '{' */ {0x06,0x04,0x04,0x08,0x04,0x04,0x06},
+    /* '|' */ {0x04,0x04,0x04,0x00,0x04,0x04,0x04},
+    /* '}' */ {0x0C,0x08,0x08,0x04,0x08,0x08,0x0C},
+    /* '~' (maps to ±) */ {0x00,0x04,0x0E,0x04,0x00,0x1F,0x00},
+};
+
 static const uint8_t *glyph(char c)
 {
-    static const uint8_t G[][7] = {
-        {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
-        {0x0E,0x11,0x01,0x06,0x08,0x10,0x1F}, {0x0E,0x11,0x01,0x06,0x01,0x11,0x0E},
-        {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}, {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
-        {0x0E,0x11,0x10,0x1E,0x11,0x11,0x0E}, {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},
-        {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, {0x0E,0x11,0x11,0x0F,0x01,0x11,0x0E},
-        {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}, {0x11,0x11,0x11,0x1F,0x11,0x11,0x11},
-        {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}, {0x11,0x11,0x11,0x11,0x11,0x0A,0x04},
-        {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, {0x10,0x10,0x10,0x10,0x10,0x10,0x1F},
-        {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}, {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D},
-        {0x00,0x00,0x00,0x1F,0x00,0x00,0x00}, {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C},
-        {0x00,0x04,0x04,0x1F,0x04,0x04,0x00}, /* + */
-        {0x1F,0x11,0x11,0x11,0x11,0x11,0x1F}, /* D (also generic box) */
-        {0x1F,0x10,0x1C,0x10,0x10,0x10,0x10}, /* F */
-        {0x11,0x11,0x11,0x15,0x15,0x1B,0x11}, /* W */
-        {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}, /* I */
-        {0x0E,0x11,0x10,0x17,0x11,0x11,0x0F}, /* G (NOAA/misc) */
-        {0x11,0x19,0x15,0x13,0x11,0x11,0x11}, /* N */
-        {0x1F,0x04,0x04,0x04,0x04,0x04,0x04}, /* T */
-        {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}, /* E */
-        {0x10,0x10,0x12,0x14,0x18,0x14,0x12}, /* k */
-        {0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* space */
-    };
-    switch (c) {
-    case '0' ... '9': return G[c - '0'];
-    case 'M': return G[10];  case 'H': return G[11];  case 'z': return G[12];
-    case 'V': return G[13];  case 'O': return G[14];  case 'L': return G[15];
-    case 'S': return G[16];  case 'Q': return G[17];  case '-': return G[18];
-    case '.': return G[19];  case '+': return G[20];  case 'D': return G[21];
-    case 'F': return G[22];  case 'W': return G[23];  case 'I': return G[24];
-    case 'G': return G[25];  case 'N': return G[26];  case 'T': return G[27];
-    case 'E': return G[28];  case 'k': return G[29];  default:  return G[30];
-    }
+    if (c < ' ' || c > '~') return FONT[0];
+    return FONT[c - ' '];
 }
 
 static void text(int x, int y, int sc, uint16_t c, const char *s)
@@ -150,192 +323,750 @@ static void text(int x, int y, int sc, uint16_t c, const char *s)
 }
 static int text_w(const char *s, int sc) { return (int)strlen(s) * 6 * sc; }
 
+/* Right-aligned text: `x` is the right edge. */
+static void text_r(int x, int y, int sc, uint16_t c, const char *s)
+{
+    text(x - text_w(s, sc), y, sc, c, s);
+}
+
+/* Centred text: `x` is the centre. */
+static void text_c(int x, int y, int sc, uint16_t c, const char *s)
+{
+    text(x - text_w(s, sc) / 2, y, sc, c, s);
+}
+
+/* Seven-segment digit, drawn as `t`-thick strokes. */
+/* ---- 7-segment readout --------------------------------------------------- */
+
+/* Filled convex polygon (scanline). The 45-degree chamfered ends this produces
+ * are what make the readout look like a real VFD/LCD instead of stacked
+ * rectangles. */
+static void poly(const int *px, const int *py, int n, uint16_t c)
+{
+    int ymin = py[0], ymax = py[0];
+    for (int i = 1; i < n; i++) {
+        if (py[i] < ymin) ymin = py[i];
+        if (py[i] > ymax) ymax = py[i];
+    }
+    for (int y = ymin; y <= ymax; y++) {
+        float yc = (float)y + 0.5f, lo = 1e9f, hi = -1e9f;
+        for (int i = 0; i < n; i++) {
+            int j = (i + 1) % n;
+            float y0 = (float)py[i], y1 = (float)py[j];
+            if (y0 == y1) continue;
+            if (yc < fminf(y0, y1) || yc >= fmaxf(y0, y1)) continue;
+            float x = (float)px[i] + (yc - y0) * (float)(px[j] - px[i]) / (y1 - y0);
+            if (x < lo) lo = x;
+            if (x > hi) hi = x;
+        }
+        if (hi <= lo) continue;
+        int xa = (int)lroundf(lo), xb = (int)lroundf(hi);
+        if (xb > xa) rect(xa, y, xb - xa, 1, c);
+    }
+}
+
+/* Horizontal bar spanning [x0,x1], both ends chamfered by t/2. */
+static void bar_h(int x0, int x1, int y, int t, uint16_t c)
+{
+    int h = t / 2;
+    const int xs[6] = { x0 + h, x1 - h, x1, x1 - h, x0 + h, x0 };
+    const int ys[6] = { y,      y,      y + h, y + t, y + t, y + h };
+    poly(xs, ys, 6, c);
+}
+
+/* Vertical bar spanning [y0,y1], both ends chamfered by t/2. */
+static void bar_v(int x, int y0, int y1, int t, uint16_t c)
+{
+    int h = t / 2;
+    const int xs[6] = { x,      x + h, x + t, x + t, x + h, x };
+    const int ys[6] = { y0 + h, y0,    y0 + h, y1 - h, y1,   y1 - h };
+    poly(xs, ys, 6, c);
+}
+
+/* One digit. The unlit segments are drawn first at very low intensity, the way
+ * a real VFD looks, then the lit ones are drawn over them. Segments are inset
+ * by a 1 px gap so neighbouring bars read as separate strokes. */
 static void seg7_digit(int x, int y, int dw, int dh, int t, int d, uint16_t c)
 {
     static const uint8_t M[10] = {63, 6, 91, 79, 102, 109, 125, 7, 127, 111};
-    int hh = (dh - 3 * t) / 2, m = M[d];
-    if (m & 1)  rect(x + t, y, dw - 2 * t, t, c);
-    if (m & 2)  rect(x + dw - t, y + t, t, hh, c);
-    if (m & 4)  rect(x + dw - t, y + 2 * t + hh, t, hh, c);
-    if (m & 8)  rect(x + t, y + 2 * t + 2 * hh, dw - 2 * t, t, c);
-    if (m & 16) rect(x, y + 2 * t + hh, t, hh, c);
-    if (m & 32) rect(x, y + t, t, hh, c);
-    if (m & 64) rect(x + t, y + t + hh, dw - 2 * t, t, c);
+    const int h  = t / 2;      /* chamfer depth at each stroke end */
+    const int g  = 1;          /* gap between adjacent segments    */
+    const int ym = y + dh / 2; /* vertical centre                  */
+
+    /* bar_h()/bar_v() chamfer their own ends inward by h, so the OUTER extent
+     * must have h added back. The full-thickness part then lands exactly on the
+     * intended span (x+t+g .. x+dw-t-g) instead of stopping h short, which is
+     * what previously squeezed every bar into a diamond and left the middle of
+     * the digit hollow. */
+    const int hx0 = x + t - h + g;              /* A/D/G left  extent */
+    const int hx1 = x + dw - t + h - g;         /* A/D/G right extent */
+    const int gtop = ym - h;                    /* G bar top edge     */
+    const int gbot = gtop + t;                  /* G bar bottom edge  */
+    const int vy0 = y + t - h + g;              /* upper verticals: top    */
+    const int vy1 = gtop - g + h;               /*                  bottom */
+    const int vy2 = gbot + g - h;               /* lower verticals: top    */
+    const int vy3 = y + dh - t + h - g;         /*                  bottom */
+    const int xr = x + dw - t;                  /* right-hand verticals    */
+    const int m = M[d];
+
+    for (int pass = 0; pass < 2; pass++) {
+        uint16_t col = pass ? c : COL_SEG_OFF;
+        int on = pass ? m : 0x7F;
+        if (on & 1)  bar_h(hx0, hx1, y, t, col);           /* A */
+        if (on & 2)  bar_v(xr, vy0, vy1, t, col);          /* B */
+        if (on & 4)  bar_v(xr, vy2, vy3, t, col);          /* C */
+        if (on & 8)  bar_h(hx0, hx1, y + dh - t, t, col);  /* D */
+        if (on & 16) bar_v(x, vy2, vy3, t, col);           /* E */
+        if (on & 32) bar_v(x, vy0, vy1, t, col);           /* F */
+        if (on & 64) bar_h(hx0, hx1, gtop, t, col);        /* G */
+    }
 }
 
-/* ---- header: freq + mode/label + S-meter --------------------------------- */
+/* ---- waterfall colour map ------------------------------------------------ */
+
+/* Classic SDR rainbow: black -> purple -> blue -> cyan -> green -> yellow ->
+ * red -> white. Bright, high-contrast, and it reads as a waterfall at a glance. */
+static void build_wlut(void)
+{
+    static const struct { float t; int r, g, b; } STOPS[] = {
+        {0.00f,   0,   0,  16},
+        {0.12f,  28,   0,  86},
+        {0.28f,   0,  44, 176},
+        {0.44f,   0, 168, 208},
+        {0.58f,   0, 202,  92},
+        {0.72f, 232, 222,  44},
+        {0.86f, 242,  92,  28},
+        {1.00f, 255, 255, 255},
+    };
+    const int n = (int)(sizeof(STOPS) / sizeof(STOPS[0]));
+    for (int i = 0; i < 256; i++) {
+        float t = i / 255.0f;
+        int k = 0;
+        while (k < n - 2 && t > STOPS[k + 1].t) k++;
+        float span = STOPS[k + 1].t - STOPS[k].t;
+        float u = span > 0 ? (t - STOPS[k].t) / span : 0;
+        if (u < 0) u = 0;
+        if (u > 1) u = 1;
+        int r = STOPS[k].r + (int)((STOPS[k + 1].r - STOPS[k].r) * u);
+        int g = STOPS[k].g + (int)((STOPS[k + 1].g - STOPS[k].g) * u);
+        int b = STOPS[k].b + (int)((STOPS[k + 1].b - STOPS[k].b) * u);
+        s_wlut[i] = RGB565(r, g, b);
+    }
+}
+
+/* ---- level helpers ------------------------------------------------------- */
+
+/* Map a spectrum bin (already nominal dBm) onto a screen row. */
+static int level_to_y(float dbm)
+{
+    float t = (s_ref_db - dbm) / DB_SPAN; /* 0 at the top, 1 at the bottom */
+    int y = SPEC_Y0 + (int)(t * SPEC_H);
+    if (y < SPEC_Y0) y = SPEC_Y0;
+    if (y > SPEC_Y0 + SPEC_H - 1) y = SPEC_Y0 + SPEC_H - 1;
+    return y;
+}
+
+/* ---- battery ------------------------------------------------------------- */
+
+/* Icon + percentage + pack voltage. Drawn in the header's first row, which is
+ * otherwise just uptime/sample-rate/tuner, so it stays visible in every mode
+ * including the no-dongle screen. */
+static void draw_battery(void)
+{
+    const int x = 190, y = 2;
+
+    if (!s_bat.present) {
+        /* No INA226 answered: say so rather than showing a fake 0%. */
+        text(x, y + 3, 1, COL_DIM, "NO BATT");
+        return;
+    }
+
+    const int w = 24, h = 12;
+    int pct = s_bat.percent;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
+    uint16_t col = s_bat.charging ? COL_CYAN
+                 : (pct > 50 ? COL_GREEN : pct > 20 ? COL_YELLOW : COL_RED);
+
+    /* 1px outline, terminal nub, then a proportional fill inset by 2px */
+    rect(x, y, w, h, COL_DIM);
+    rect(x + 1, y + 1, w - 2, h - 2, COL_BG);
+    rect(x + w, y + h / 2 - 3, 2, 6, COL_DIM);
+    int fill = ((w - 4) * pct + 50) / 100;
+    if (fill > 0) rect(x + 2, y + 2, fill, h - 4, col);
+
+    char b[16];
+    snprintf(b, sizeof b, "%d%%", pct);
+    text(x + 30, y + 3, 1, col, b);
+
+    /* 2S pack, so ~6.4 V empty .. 8.4 V full */
+    snprintf(b, sizeof b, "%.1fV", s_bat.mv / 1000.0f);
+    text(x + 56, y + 3, 1, COL_DIM, b);
+
+    if (s_bat.charging) text(x + 88, y + 3, 1, COL_CYAN, "CHG");
+}
+
+/* ---- header -------------------------------------------------------------- */
+
+#define PLOT_X0  34
+#define PLOT_W   574
+#define PLOT_X1  (PLOT_X0 + PLOT_W)
 
 static void draw_header(void)
 {
-    rect(0, 0, LW, SPEC_Y0 - 1, COL_BG);
+    sdr_stats_t st;
+    sdr_get_stats(&st);
 
-    /* frequency, centred, 3-decimal MHz */
-    char buf[16];
-    snprintf(buf, sizeof buf, "%.3f", s_center / 1e6);
-    const int dw = 17, dh = 28, t = 3, gap = 4, dotw = 8;
-    int width = 0;
-    for (const char *p = buf; *p; p++) width += (*p == '.') ? dotw : (dw + gap);
-    int x = (LW - width) / 2, y = 8;
-    for (const char *p = buf; *p; p++) {
-        if (*p == '.') { rect(x + 2, y + dh - 5, 5, 5, COL_LINE); x += dotw; }
-        else { seg7_digit(x, y, dw, dh, t, *p - '0', COL_LINE); x += dw + gap; }
+    rect(0, 0, LW, HDR_H, COL_BG);
+
+    /* --- row 1: uptime, sample rate, tuner ------------------------------- */
+    int64_t up = esp_timer_get_time() / 1000000;
+    char b[48];
+    snprintf(b, sizeof b, "UP %02d:%02d:%02d",
+             (int)(up / 3600) % 100, (int)(up / 60) % 60, (int)(up % 60));
+    text(8, 3, 1, COL_DIM, b);
+
+    snprintf(b, sizeof b, "%.3f MSPS", st.sample_rate / 1e6);
+    text(112, 3, 1, COL_DIM, b);
+
+    /* Tuner name, or an explicit "NO DONGLE" — the dongle shares the USB port
+     * with the flashing link, so its absence is normal and must be legible. */
+    if (st.present) text_r(632, 3, 1, COL_DIM, st.tuner);
+    else            text_r(632, 3, 1, COL_YELLOW, "NO DONGLE");
+
+    draw_battery();
+
+    /* --- row 2: big frequency readout, grouped MHz.kHz.Hz ----------------- */
+    char d[16];
+    snprintf(d, sizeof d, "%09u", (unsigned)s_center); /* 89500000 -> 089.500.000 */
+    int nd = (int)strlen(d);
+    /* Thick strokes and chamfered ends read as an instrument panel; thin square
+     * bars just look like a calculator. The cell is sized to sit strictly
+     * between row 1 (y<=14) and the parameter strip (y=50), so it cannot
+     * collide with either. */
+    const int dw = 23, dh = 33, t = 5, gap = 7, dotw = 12;
+    int x = 8;  /* left-aligned: the readout anchors the header like a real
+                 * analyzer, with the mode badge pushed out to the right. */
+    int y = 15;
+    for (int i = 0; i < nd; i++) {
+        if (i && (nd - i) % 3 == 0) { /* thousands group separator */
+            rect(x + 3, y + dh - 12, 5, 5, COL_DIM);
+            x += dotw;
+        }
+        seg7_digit(x, y, dw, dh, t, d[i] - '0', COL_WHITE);
+        x += dw + gap;
+    }
+    text(x, y + dh - 11, 1, COL_DIM, "Hz");
+    /* --- mode badge (touch target: tap to toggle WFM/NFM) ---------------- */
+    {
+        uint16_t fg;
+        const char *lab;
+        switch (s_mode) {
+        case DSP_MODE_AM:  fg = COL_CYAN;   lab = "AM";  break;
+        case DSP_MODE_NFM: fg = COL_YELLOW; lab = "NFM"; break;
+        default:           fg = COL_GREEN;  lab = "WFM"; break;
+        }
+        /* Show a box only while touched, so the idle header stays clean while
+         * still being obviously tappable once you press it. */
+        if (s_mode_hot) {
+            rect(MODE_BOX_X0, MODE_BOX_Y0, MODE_BOX_X1 - MODE_BOX_X0,
+                 MODE_BOX_Y1 - MODE_BOX_Y0, fg);
+            fg = COL_BG;
+        }
+        text_c((MODE_BOX_X0 + MODE_BOX_X1) / 2, y + 4, 2, fg, lab);
     }
 
-    /* mode + bookmark label, top-left */
-    text(6, 4, 2, s_nfm ? RGB565(255, 160, 0) : COL_ACCENT, s_nfm ? "NFM" : "WFM");
-    text(6, 24, 1, COL_TEXT, s_label);
+    /* --- row 3: parameter strip ------------------------------------------ */
+    int yy = 50;
+    int px = 8;
+    snprintf(b, sizeof b, "FPS %2d", s_fps);
+    text(px, yy, 1, COL_TEXT, b);
 
-    /* S-meter top-right, -60..+60 relative scale */
-    int mx = 470, my = 6, mw = 160, mh = 11;
-    rect(mx, my, mw, mh, COL_TRACK);
-    float tt = (dsp_signal_db() - SQ_OFFSET + 60.0f) / 120.0f;
-    if (tt < 0) tt = 0;
-    if (tt > 1) tt = 1;
-    rect(mx, my, (int)(mw * tt), mh, COL_ACCENT);
-    if (s_squelch > -60) {
-        float ts = (s_squelch + 60.0f) / 120.0f;
-        rect(mx + (int)(mw * ts), my - 3, 2, mh + 6, RGB565(240, 80, 80));
-    }
-    text(mx, my + mh + 2, 1, COL_TEXT, "SIG");
+    px += 62;
+    snprintf(b, sizeof b, "REF %+d", (int)lroundf(s_ref_db));
+    text(px, yy, 1, COL_TEXT, b);
+
+    px += 68;
+    snprintf(b, sizeof b, "DROP %uK", (unsigned)(st.dropped_bytes / 1024));
+    text(px, yy, 1, st.dropped_bytes ? COL_RED : COL_DIM, b);
+
+    /* live peak of the current frame, in the same nominal dBm scale */
+    snprintf(b, sizeof b, "PK %+6.1f", s_peak_dbm);
+    text_r(632, yy, 1, COL_GREEN, b);
+
+    hline(0, HDR_H - 1, LW, COL_GRID);
 }
 
-/* ---- spectrum + waterfall ------------------------------------------------ */
+/* ---- spectrum ------------------------------------------------------------ */
 
-static uint16_t heat(float t)
+static void draw_graticule(void)
 {
-    if (t < 0) t = 0;
-    if (t > 1) t = 1;
-    int r = (int)(255 * (t - 0.5f) * 2.0f), b = (int)(255 * (0.5f - t) * 2.0f);
-    int g = (int)(255 * (1.0f - fabsf(t - 0.5f) * 2.0f));
-    if (r < 0) r = 0;
-    if (b < 0) b = 0;
-    if (g < 0) g = 0;
-    return RGB565(r, g, b);
+    /* horizontal: one line per 10 dB row, 8 rows across the plot */
+    for (int i = 0; i <= GRID_DIV; i++) {
+        int y = SPEC_Y0 + (i * SPEC_H) / GRID_DIV;
+        hline(PLOT_X0, y, PLOT_W, (i == 0 || i == GRID_DIV) ? COL_GRID : COL_GRIDV);
+    }
+    /* vertical: dotted columns, like the analyzer's fine graticule */
+    for (int i = 0; i <= GRID_DIV; i++) {
+        int x = PLOT_X0 + (i * PLOT_W) / GRID_DIV;
+        for (int y = SPEC_Y0; y < SPEC_Y0 + SPEC_H; y += 3)
+            LBUF[(size_t)y * LW + x] = COL_GRIDV;
+    }
+
+    /* dBm labels on both edges — 10 dB per row */
+    char b[12];
+    for (int i = 0; i <= GRID_DIV; i++) {
+        int y = SPEC_Y0 + (i * SPEC_H) / GRID_DIV - 3;
+        snprintf(b, sizeof b, "%d", (int)lroundf(s_ref_db) - i * 10);
+        text_r(PLOT_X0 - 6, y, 1, COL_DIM, b);
+        text(PLOT_X1 + 6, y, 1, COL_DIM, b);
+    }
+}
+
+static void draw_ruler(void)
+{
+    /* Clear the whole band between the plot and the waterfall first.
+     *
+     * draw_spectrum() only clears SPEC_Y0..SPEC_Y0+SPEC_H, which stops above
+     * this band, and text() draws set pixels without a background. So without
+     * this the labels from the previous frequency stay behind and the new ones
+     * land on top of them — visibly ghosted text while dragging to retune. */
+    rect(0, SPEC_Y0 + SPEC_H, LW, WF_Y0 - (SPEC_Y0 + SPEC_H), COL_BG);
+
+    /* Frequency ruler: one tick + label per vertical gridline, labelled in
+     * MHz like the analyzer head in the reference (left edge -> right edge). */
+    float span = SDR_DEFAULT_SAMPLE_RATE / 2.0f;
+    char b[16];
+
+    hline(PLOT_X0, RULER_Y, PLOT_W, COL_GRID);
+    for (int i = 0; i <= GRID_DIV; i++) {
+        int x = PLOT_X0 + (i * PLOT_W) / GRID_DIV;
+        vline(x, RULER_Y, 4, COL_GRID);
+
+        float hz = (float)s_center - span + 2.0f * span * (float)i / GRID_DIV;
+        snprintf(b, sizeof b, "%.3f", hz / 1e6);
+        int tx = x - text_w(b, 1) / 2;
+        if (tx < 2) tx = 2;
+        if (tx + text_w(b, 1) > LW - 2) tx = LW - 2 - text_w(b, 1);
+        text(tx, RULER_Y + 6, 1, (i == GRID_DIV / 2) ? COL_CURSOR : COL_DIM, b);
+    }
 }
 
 static void draw_spectrum(const float *spec, int bins)
 {
-    memmove(LBUF + (size_t)(WF_Y0 + 1) * LW, LBUF + (size_t)WF_Y0 * LW,
-            (size_t)(WF_H - 1) * LW * sizeof(uint16_t));
-    int cx = LW / 2;
-    for (int x = 0; x < LW; x++) {
-        int bin = (x * bins) / LW;
-        float tt = (spec[bin] - DB_MIN) / (DB_MAX - DB_MIN);
-        LBUF[(size_t)WF_Y0 * LW + x] = heat(tt);
-        int h = (int)(SPEC_H * (tt < 0 ? 0 : tt > 1 ? 1 : tt));
-        int ytop = SPEC_Y0 + SPEC_H - h;
-        for (int y = SPEC_Y0; y < SPEC_Y0 + SPEC_H; y++)
-            LBUF[(size_t)y * LW + x] = (y >= ytop) ? COL_ACCENT : COL_BG;
+    /* ---- reference level: follow the frame's own noise floor ------------- */
+    float lo = spec[0];
+    for (int i = 1; i < bins; i++)
+        if (spec[i] < lo) lo = spec[i];
+    s_nf_dbm = lo;
+    float target = lo + DB_SPAN; /* noise sits on the bottom */
+    if (!s_ref_init) { s_ref_db = target; s_ref_init = true; }
+    else s_ref_db += (target - s_ref_db) * REF_SLEW;
+
+    /* clear plot + gutters, then the graticule under the trace */
+    rect(0, SPEC_Y0, LW, SPEC_H, COL_BG);
+    draw_graticule();
+
+    /* ---- trace: fill below the curve, bright 1px curve on top ----------- */
+    float hi = spec[0];
+    for (int i = 0; i < PLOT_W; i++) {
+        int bin = (i * bins) / PLOT_W;
+        float db = spec[bin];
+        if (db > hi) hi = db;
+        int ytop = level_to_y(db);
+        int x = PLOT_X0 + i;
+        for (int y = ytop; y < SPEC_Y0 + SPEC_H; y++)
+            LBUF[(size_t)y * LW + x] = COL_FILL;
+        LBUF[(size_t)ytop * LW + x] = COL_TRACE;
+
+        /* peak hold: instant attack, slow decay */
+        float dbm = db;
+        if (dbm > s_peak[i] || s_peak[i] == 0) s_peak[i] = dbm;
+        else s_peak[i] -= PEAK_DECAY;
+        float pt = (s_ref_db - s_peak[i]) / DB_SPAN;
+        int py = SPEC_Y0 + (int)(pt * SPEC_H);
+        if (py >= SPEC_Y0 && py < SPEC_Y0 + SPEC_H)
+            LBUF[(size_t)py * LW + x] = COL_PEAK;
     }
-    for (int y = SPEC_Y0; y < WF_Y0 + WF_H; y++) LBUF[(size_t)y * LW + cx] = COL_LINE;
+    s_peak_dbm = hi;
+
+    /* centre cursor */
+    vline(LW / 2, SPEC_Y0, SPEC_H, RGB565(60, 30, 30));
+
+    draw_ruler();
+
+    /* ---- waterfall: scroll one row down, push the newest frame on top --- */
+    /* Rows are LW pixels wide but only the PLOT_W-wide plot area scrolls, so
+     * this has to be a per-row copy — a single memmove of a contiguous
+     * (WF_H-1)*PLOT_W block would walk diagonally through the buffer. */
+    for (int y = WF_Y0 + WF_H - 1; y > WF_Y0; y--)
+        memcpy(LBUF + (size_t)y * LW + PLOT_X0,
+               LBUF + (size_t)(y - 1) * LW + PLOT_X0,
+               (size_t)PLOT_W * sizeof(uint16_t));
+    for (int i = 0; i < PLOT_W; i++) {
+        int bin = (i * bins) / PLOT_W;
+        /* Waterfall has its own, much tighter range: the noise floor maps to
+         * WF_BASE (deep blue, not black) and ~25 dB above it is white. */
+        float over = spec[bin] - s_nf_dbm;
+        float t = WF_BASE + over / WF_SPAN;
+        if (t < 0) t = 0;
+        if (t > 1) t = 1;
+        LBUF[(size_t)WF_Y0 * LW + PLOT_X0 + i] = s_wlut[(int)(t * 255.0f)];
+    }
+
+    /* waterfall time axis in the left gutter (cleared so labels don't smear) */
+    rect(0, WF_Y0, PLOT_X0, WF_H, COL_BG);
+    static const int MARKS = 6;
+    for (int i = 0; i <= MARKS; i++) {
+        int y = WF_Y0 + (i * (WF_H - 1)) / MARKS;
+        hline(PLOT_X0 - 4, y, 4, COL_DIM);
+        char tb[10];
+        float sec = (float)(i * (WF_H - 1) / MARKS) / (s_fps > 0 ? s_fps : 20);
+        snprintf(tb, sizeof tb, "-%.1f", sec);
+        text_r(PLOT_X0 - 7, y - 3, 1, COL_DIM, tb);
+    }
 }
 
-/* ---- control band -------------------------------------------------------- */
+/* ---- volume -------------------------------------------------------------- */
 
-typedef struct { int x, y, w, h; } box_t;
-static const box_t B_TDN  = {  6, 220, 56, 44};  /* tune down one step */
-static const box_t B_STEP = { 66, 220, 96, 44};  /* cycle step size    */
-static const box_t B_TUP  = {166, 220, 56, 44};  /* tune up one step   */
-static const box_t B_MODE = {256, 220, 92, 44};  /* WFM/NFM */
-static const box_t B_WX   = {  6, 272, 92, 44};
-static const box_t B_FDNY = {102, 272, 120, 44};
-static const box_t B_EMS  = {226, 272, 120, 44};
-static const box_t B_VDN  = {404, 226, 46, 44};
-static const box_t B_VUP  = {540, 226, 46, 44};
-static const box_t B_SDN  = {404, 300, 46, 44};
-static const box_t B_SUP  = {540, 300, 46, 44};
-
-static void draw_box(const box_t *b, const char *label, int sc, uint16_t fill)
+/* Vertical 8-step level bar in the gutter to the right of the waterfall.
+ *
+ * Nothing else paints in this strip: draw_spectrum() only scrolls PLOT_W
+ * columns, and the dBm labels stop at the bottom of the spectrum band. So the
+ * control occupies dead space instead of competing with the plot. */
+static void draw_volume(void)
 {
-    rect(b->x, b->y, b->w, b->h, fill);
-    rect(b->x, b->y, b->w, 2, COL_BTN_HI);
-    text(b->x + (b->w - text_w(label, sc)) / 2, b->y + b->h / 2 - 4 * sc, sc, COL_TEXT, label);
+    const int x0 = VOL_ZONE_X0, w = VOL_ZONE_X1 - VOL_ZONE_X0;
+    const int y0 = VOL_BAR_TOP - 16, y1 = VOL_BAR_BOT + 2;
+    rect(x0, y0, w, y1 - y0, COL_BG);
+
+    const int gap = 2;
+    const int span = VOL_BAR_BOT - VOL_BAR_TOP;
+    const int seg_h = (span - (VOL_SEGS - 1) * gap) / VOL_SEGS;
+    const int bw = VOL_BAR_X1 - VOL_BAR_X0;
+
+    /* Segments are stacked bottom-up, so a taller bar reads as "louder". */
+    for (int i = 0; i < VOL_SEGS; i++) {
+        int yb = VOL_BAR_BOT - i * (seg_h + gap);
+        int yt = yb - seg_h;
+        bool on = (s_vol_level > i);
+        uint16_t c;
+        if (!on) c = COL_GRIDV;
+        else if (s_vol_hot) c = COL_CYAN;
+        else if (i < VOL_SEGS / 2) c = COL_GREEN;
+        else c = COL_TRACE; /* upper half brighter: reads as "loud" */
+        rect(VOL_BAR_X0, yt, bw, seg_h, c);
+    }
+
+    /* "VOL" label above the bar. The bar itself already shows the level, so a
+     * number would be redundant — the label is what the reader actually needs.
+     * It is only 18 px wide (3 glyphs x 6), which fits the 32 px gutter. */
+    text_c((x0 + VOL_ZONE_X1) / 2, VOL_BAR_TOP - 13, 1,
+           s_vol_hot ? COL_CYAN : COL_DIM, "VOL");
 }
 
-static void draw_controls(void)
+/* Map a touch Y inside the bar to a level. Tapping a segment selects it, so
+ * the whole 8-step range is reachable with single taps. */
+static int vol_level_from_y(int ly)
 {
-    rect(0, CTRL_Y0, LW, LH - CTRL_Y0, COL_PANEL);
-    char sl[12];
-    step_label(sl, sizeof sl);
-    draw_box(&B_TDN, "-", 3, COL_BTN);
-    draw_box(&B_STEP, sl, 2, RGB565(70, 70, 110));
-    draw_box(&B_TUP, "+", 3, COL_BTN);
-    draw_box(&B_MODE, s_nfm ? "NFM" : "WFM", 2, s_nfm ? RGB565(120, 70, 0) : RGB565(0, 80, 50));
-    draw_box(&B_WX, "WX", 2, COL_BTN);
-    draw_box(&B_FDNY, "FDNY", 2, COL_BTN);
-    draw_box(&B_EMS, "EMS", 2, COL_BTN);
-
-    char v[8];
-    text(404, 212, 2, COL_TEXT, "VOL");
-    draw_box(&B_VDN, "-", 3, COL_BTN);
-    draw_box(&B_VUP, "+", 3, COL_BTN);
-    snprintf(v, sizeof v, "%d", s_volume);
-    text(470, 238, 3, COL_LINE, v);
-
-    text(404, 286, 2, COL_TEXT, "SQL");
-    draw_box(&B_SDN, "-", 3, COL_BTN);
-    draw_box(&B_SUP, "+", 3, COL_BTN);
-    snprintf(v, sizeof v, "%d", s_squelch);
-    text(466, 312, 3, COL_LINE, v);
+    int span = VOL_BAR_BOT - VOL_BAR_TOP;
+    if (span <= 0) return s_vol_level;
+    int up = VOL_BAR_BOT - ly; /* 0 at the bottom, span at the top */
+    if (up < 0) up = 0;
+    if (up > span) up = span;
+    /* Round to the nearest segment so a tap selects the one under the finger. */
+    int lvl = (up * VOL_SEGS + span / 2) / span;
+    if (lvl < 1) lvl = 1;
+    if (lvl > VOL_SEGS) lvl = VOL_SEGS;
+    return lvl;
 }
 
-/* ---- actions ------------------------------------------------------------- */
+static void set_vol_level(int lvl)
+{
+    if (lvl < 1) lvl = 1;
+    if (lvl > VOL_SEGS) lvl = VOL_SEGS;
+    if (lvl == s_vol_level) return;
+    s_vol_level = lvl;
+    /* The codec takes 0..100; spread the 8 steps across the full range. */
+    audio_set_volume(lvl * 100 / VOL_SEGS);
+    s_redraw = true;
+}
 
-static void retune(int64_t hz)
+/* ---- numeric keypad ------------------------------------------------------ */
+/*
+ * A modal frequency entry panel. Tapping the 7-segment readout opens it.
+ *
+ * Frequencies are entered in MHz with an optional decimal point ("121.5"),
+ * because that is how they are actually quoted; typing nine raw Hz digits would
+ * be slow and easy to get wrong by a factor of ten. The panel is seeded with the
+ * current frequency so a one-digit edit does not mean retyping everything.
+ *
+ * While open it is modal: every touch is consumed here, and it is painted last
+ * (after the live spectrum) so nothing can draw over it.
+ */
+#define KP_CANCEL 12
+#define KP_OK     13
+#define KP_NONE   (-1)
+
+/* Digits the user may type. Kept well below sizeof s_kp_buf, which has to be
+ * roomy because snprintf("%.6g") is allowed to emit exponent form. */
+#define KP_MAX_LEN 10
+
+static void kp_key_rect(int idx, int *x, int *y)
+{
+    *x = KP_X0 + KP_PAD + (idx % 3) * (KP_KEY_W + KP_GAP);
+    *y = KP_GRID_Y + (idx / 3) * (KP_KEY_H + KP_GAP);
+}
+
+/* Which control is at (lx,ly)? Key index 0..11, KP_CANCEL, KP_OK or KP_NONE. */
+static int kp_hit(int lx, int ly)
+{
+    for (int i = 0; i < 12; i++) {
+        int x, y;
+        kp_key_rect(i, &x, &y);
+        if (lx >= x && lx < x + KP_KEY_W && ly >= y && ly < y + KP_KEY_H) return i;
+    }
+    int by = KP_BTN_Y;
+    if (ly >= by && ly < by + KP_BTN_H) {
+        if (lx >= KP_X0 + KP_PAD && lx < KP_X0 + KP_PAD + KP_BTN_W) return KP_CANCEL;
+        if (lx >= KP_X0 + KP_PAD + KP_BTN_W + KP_GAP &&
+            lx < KP_X0 + KP_PAD + 2 * KP_BTN_W + KP_GAP) return KP_OK;
+    }
+    return KP_NONE;
+}
+
+static void kp_open(void)
+{
+    /* %.6g keeps it compact: 100 -> "100", 121.5 -> "121.5", 145.125 -> "145.125".
+     * "%.3f" would pad to "121.500", which then needs three deletes to edit. */
+    snprintf(s_kp_buf, sizeof s_kp_buf, "%.6g", s_center / 1e6);
+    s_kp_len = (int)strlen(s_kp_buf);
+    s_kp_open = true;
+    s_kp_hot = -1;
+}
+
+static void kp_close(bool apply)
+{
+    if (apply) {
+        char *end = NULL;
+        double mhz = strtod(s_kp_buf, &end);
+        if (end != s_kp_buf && mhz > 0) {
+            double hz = mhz * 1e6;
+            /* Clamp rather than reject: typing "1215" means 1215 MHz, which is
+             * out of range, and landing on the band edge is more useful than
+             * silently doing nothing. */
+            if (hz < FREQ_MIN) hz = FREQ_MIN;
+            if (hz > FREQ_MAX) hz = FREQ_MAX;
+            ui_set_freq((uint32_t)(hz + 0.5));
+        }
+    }
+    s_kp_open = false;
+    s_kp_hot = -1;
+    s_kp_closed = true; /* tell ui_task to repaint what was underneath */
+}
+
+static void kp_apply(int hit)
+{
+    if (hit >= 0 && hit < 12) {
+        const char *lab = KP_LABELS[hit];
+        if (!strcmp(lab, "DEL")) {
+            if (s_kp_len > 0) s_kp_buf[--s_kp_len] = '\0';
+        } else if (!strcmp(lab, ".")) {
+            /* One decimal point only, and never as the first character. */
+            if (s_kp_len > 0 && !strchr(s_kp_buf, '.') &&
+                s_kp_len < KP_MAX_LEN) {
+                s_kp_buf[s_kp_len++] = '.';
+                s_kp_buf[s_kp_len] = '\0';
+            }
+        } else if (s_kp_len < KP_MAX_LEN) {
+            s_kp_buf[s_kp_len++] = lab[0];
+            s_kp_buf[s_kp_len] = '\0';
+        }
+    } else if (hit == KP_CANCEL) {
+        kp_close(false);
+    } else if (hit == KP_OK) {
+        kp_close(true);
+    }
+}
+
+static void draw_keypad(void)
+{
+    /* Replace the whole buffer instead of dimming it. The waterfall scrolls in
+     * place inside this same buffer, so an overlay would be pushed downwards as
+     * if it were history and leave ghost rows behind. Painting black here and
+     * rebuilding everything on close keeps the two consistent. */
+    rect(0, 0, LW, LH, COL_BG);
+    rect(KP_X0, KP_Y0, KP_W, KP_H, COL_BG);
+    hline(KP_X0, KP_Y0, KP_W, COL_CYAN);
+    hline(KP_X0, KP_Y0 + KP_H - 1, KP_W, COL_CYAN);
+    vline(KP_X0, KP_Y0, KP_H, COL_CYAN);
+    vline(KP_X0 + KP_W - 1, KP_Y0, KP_H, COL_CYAN);
+
+    /* --- entered value --------------------------------------------------- */
+    rect(KP_X0 + KP_PAD, KP_VAL_Y, KP_W - 2 * KP_PAD, KP_VAL_H, RGB565(0, 26, 14));
+    const char *shown = s_kp_len ? s_kp_buf : "_";
+    text(KP_X0 + KP_PAD + 6, KP_VAL_Y + 12, 2, COL_WHITE, shown);
+    text_r(KP_X0 + KP_W - KP_PAD - 6, KP_VAL_Y + 8, 1, COL_DIM, "MHz");
+
+    /* --- keys ------------------------------------------------------------ */
+    for (int i = 0; i < 12; i++) {
+        int x, y;
+        kp_key_rect(i, &x, &y);
+        bool hot = (s_kp_hot == i);
+        rect(x, y, KP_KEY_W, KP_KEY_H, hot ? COL_GREEN : RGB565(0, 34, 18));
+        hline(x, y, KP_KEY_W, hot ? COL_GREEN : COL_GRID);
+        text_c(x + KP_KEY_W / 2, y + KP_KEY_H / 2 - 7, 2,
+               hot ? COL_BG : COL_GREEN, KP_LABELS[i]);
+    }
+
+    /* --- buttons --------------------------------------------------------- */
+    int by = KP_BTN_Y;
+    int cx = KP_X0 + KP_PAD;
+    bool hc = (s_kp_hot == KP_CANCEL), ho = (s_kp_hot == KP_OK);
+    rect(cx, by, KP_BTN_W, KP_BTN_H, hc ? COL_RED : RGB565(40, 12, 12));
+    text_c(cx + KP_BTN_W / 2, by + KP_BTN_H / 2 - 7, 2,
+           hc ? COL_BG : COL_RED, "CANCEL");
+    int ox = cx + KP_BTN_W + KP_GAP;
+    rect(ox, by, KP_BTN_W, KP_BTN_H, ho ? COL_GREEN : RGB565(10, 40, 20));
+    text_c(ox + KP_BTN_W / 2, by + KP_BTN_H / 2 - 7, 2,
+           ho ? COL_BG : COL_GREEN, "OK");
+}
+
+/* ---- footer -------------------------------------------------------------- */
+
+static void draw_footer(void)
+{
+    rect(0, FOOT_Y, LW, LH - FOOT_Y, COL_BG);
+    hline(0, FOOT_Y, LW, COL_GRID);
+    text(8, FOOT_Y + 5, 1, COL_DIM, "TAB5-SDR  RTL2832U");
+    text_c(LW / 2, FOOT_Y + 5, 1, COL_DIM, "SPECTRUM / WATERFALL");
+    text_r(632, FOOT_Y + 5, 1, COL_DIM, "TUNE:TAP/DRAG  MODE:TAP  VOL:RIGHT");
+}
+
+/* ---- present ------------------------------------------------------------- */
+
+static void present(void)
+{
+    /* 90° maps the landscape buffer onto the portrait panel upright; 270° is the
+     * same rotation the other way, which turns the whole image upside down.
+     * Both produce 360x640 before the 2x scale, so the output geometry is
+     * identical and nothing else has to change. */
+    ppa_do_scale_rotate_mirror(s_ppa, &(ppa_srm_oper_config_t){
+        .in = { .buffer = LBUF, .pic_w = LW, .pic_h = LH, .block_w = LW, .block_h = LH,
+                .srm_cm = PPA_SRM_COLOR_MODE_RGB565 },
+        .out = { .buffer = bsp_tab5_display_get_frame_buffer(s_fb_index),
+                 .buffer_size = PANEL_W * PANEL_H * 2, .pic_w = PANEL_W, .pic_h = PANEL_H,
+                 .srm_cm = PPA_SRM_COLOR_MODE_RGB565 },
+        .rotation_angle = s_flipped ? PPA_SRM_ROTATION_ANGLE_270
+                                    : PPA_SRM_ROTATION_ANGLE_90,
+        .scale_x = SCALE, .scale_y = SCALE,
+    });
+    bsp_tab5_display_flush(s_fb_index);
+    s_fb_index ^= 1;
+}
+
+/* ---- touch --------------------------------------------------------------- */
+
+/* Tuning sensitivity while dragging. The visible span is only
+ * SDR_DEFAULT_SAMPLE_RATE/2 = 576 kHz across a 574 px plot, i.e. ~2 kHz per
+ * pixel would be a strict 1:1 "grab". That feels sluggish on a 5" panel, so
+ * 4 kHz/px gives a full-width swipe ~2.5 MHz (about two visible spans) while
+ * still resolving fine moves: 200 kHz of FM dial spacing is a 50 px drag. */
+#define DRAG_HZ_PER_PX 4000
+
+/* Retuning the R820T costs several USB control transfers (the RTL2832 bridges
+ * them to the tuner's I2C), so pushing every pixel of a drag would hammer the
+ * same USB link the IQ stream depends on. Coalesce: only push once the target
+ * has moved by at least this much (2.5 px at the sensitivity above). */
+#define MIN_TUNE_STEP_HZ 10000
+
+/* Retune without dropping the spectrum accumulator. ui_set_freq() flushes the
+ * half-mixed frame, which is right for discrete jumps but would blank the
+ * display if done on every frame of a continuous drag. */
+static void tune_live(int64_t hz)
 {
     if (hz < FREQ_MIN) hz = FREQ_MIN;
     if (hz > FREQ_MAX) hz = FREQ_MAX;
+    if ((uint32_t)hz == s_center) return;
     s_center = (uint32_t)hz;
     sdr_set_center_freq(s_center);
+    s_redraw = true; /* repaint the frequency readout on the very next frame */
 }
 
-static void set_mode(int nfm)
+/* A horizontal move smaller than this (logical px, so ~16 px on the glass) is
+ * treated as finger jitter, not as a drag. Without it every tap would retune by
+ * a few kHz before the finger came up. */
+#define TAP_SLOP 8
+
+/* Tapping a point in the plot retunes so that point becomes the centre — i.e.
+ * whatever is under the finger moves to the middle of the screen. The scale is
+ * the visible span (SDR_DEFAULT_SAMPLE_RATE/2 either side of centre), not the
+ * drag sensitivity, so the tap lands exactly where it was aimed. */
+static void tune_to_plot_x(int lx)
 {
-    s_nfm = nfm ? 1 : 0;
-    dsp_set_mode(s_nfm);
+    const float span = SDR_DEFAULT_SAMPLE_RATE / 2.0f; /* half-width, Hz */
+    const float hz_per_px = 2.0f * span / (float)PLOT_W;
+
+    /* Clamp to the plot: a tap in the dBm label gutter (x < PLOT_X0) or past the
+     * right edge should land on the nearest edge of the span, not extrapolate
+     * into a frequency that is not on screen. */
+    if (lx < PLOT_X0) lx = PLOT_X0;
+    if (lx > PLOT_X1) lx = PLOT_X1;
+
+    const float off = (float)(lx - (PLOT_X0 + PLOT_W / 2)) * hz_per_px;
+    int64_t want = (int64_t)llroundf((float)s_center + off);
+
+    if (want < FREQ_MIN) want = FREQ_MIN;
+    if (want > FREQ_MAX) want = FREQ_MAX;
+    /* Discrete jump, so drop the half-mixed accumulator like ui_set_freq(). */
+    ui_set_freq((uint32_t)want);
 }
 
-static void apply_squelch(void)
+static void toggle_mode(void)
 {
-    dsp_set_squelch_db(s_squelch <= -60 ? -200.0f : (float)s_squelch + SQ_OFFSET);
+    /* WFM -> NFM -> AM -> WFM. One badge, one tap: no hidden gestures, and the
+     * badge always shows the mode that is actually running. */
+    s_mode = (s_mode + 1) % DSP_MODE_COUNT;
+    dsp_set_mode(s_mode);
+    s_redraw = true;
 }
 
-static void select_bookmark(const bookmark_t *b)
-{
-    retune(b->hz);
-    set_mode(b->nfm);
-    s_label = b->name;
-}
-
-static bool hit(const box_t *b, int x, int y)
-{
-    return x >= b->x && x < b->x + b->w && y >= b->y && y < b->y + b->h;
-}
-
+/* Read the panel and apply gestures. Returns true when the screen needs a
+ * repaint. */
 static bool handle_touch(void)
 {
-    static bool prev = false, dragging = false;
-    static int drag_x0;
+    static bool prev, dragging, moved;
+    static int drag_x0, tap_x, run, grace;
     static uint32_t drag_f0;
-    static int grace = 0;    /* ignore touches briefly after boot */
-    static int run = 0;      /* consecutive raw-pressed samples (debounce) */
     bool changed = false;
 
     esp_lcd_touch_point_data_t p;
     int n = bsp_tab5_touch_read(&p, 1);
 
-    /* ~1.2 s startup grace: the touch controller reports stray points right after
-     * init that would otherwise "tap" a control. */
+    /* The controller reports stray points for ~1 s after init. Without this
+     * grace period the mode badge toggles itself at boot. */
     if (grace < 150) { grace++; prev = false; run = 0; return false; }
 
-    /* Debounce: a press must persist for 2 polls (~16 ms) before it counts,
-     * rejecting single-sample glitches. */
+    /* A press must survive 2 polls (~16 ms) before it counts: rejects
+     * single-sample glitches without making taps feel laggy. */
     run = (n > 0) ? run + 1 : 0;
     bool pressed = run >= 2;
+
     int lx = 0, ly = 0;
     if (pressed) {
-        lx = (PANEL_H - p.y) / SCALE;
-        ly = p.x / SCALE;
+        /* The panel is portrait 720x1280; this buffer is 640x360, which the PPA
+         * scaled 2x and rotated 90°. Undo both to get landscape coordinates.
+         * When the image is flipped the rotation is 270° instead, so the
+         * inverse mapping is mirrored too — otherwise every touch would land
+         * on the opposite side of the screen. */
+        if (s_flipped) {
+            lx = p.y / SCALE;
+            ly = (PANEL_W - p.x) / SCALE;
+        } else {
+            lx = (PANEL_H - p.y) / SCALE;
+            ly = p.x / SCALE;
+        }
         if (lx < 0) lx = 0;
         if (lx >= LW) lx = LW - 1;
         if (ly < 0) ly = 0;
@@ -343,89 +1074,241 @@ static bool handle_touch(void)
     }
     bool edge = pressed && !prev;
 
-    if (pressed && ly < CTRL_Y0) {
-        /* drag the spectrum/waterfall to scan */
-        if (edge) { dragging = true; drag_x0 = lx; drag_f0 = s_center; }
-        else if (dragging) {
-            int64_t df = -(int64_t)(lx - drag_x0) * DRAG_HZ_PER_PX;
-            retune((int64_t)drag_f0 + df);
-            s_label = "manual";
+    /* While the keypad is open it is modal: every touch belongs to it, and the
+     * gestures underneath (tune, volume, mode) must not fire. Acting on release
+     * rather than on press means a finger dragged onto the wrong key can be
+     * slid off before letting go, like a real keypad. */
+    if (s_kp_open) {
+        if (!pressed) {
+            int done = s_kp_hot;
+            s_kp_hot = KP_NONE;
+            if (done != KP_NONE) { kp_apply(done); changed = true; }
+        } else {
+            int hit = kp_hit(lx, ly);
+            if (hit != s_kp_hot) { s_kp_hot = hit; changed = true; }
+        }
+        prev = pressed;
+        return changed;
+    }
+
+    if (!pressed) {
+        /* A press that ended without ever moving past TAP_SLOP is a tap: retune
+         * so the touched point becomes the centre. `dragging` is only set by the
+         * plot branch, so this can never fire for the badge or the volume bar. */
+        if (dragging && !moved) {
+            tune_to_plot_x(tap_x);
             changed = true;
+        }
+        dragging = false;
+        moved = false;
+        if (s_mode_hot) { s_mode_hot = false; changed = true; }
+        if (s_vol_hot)  { s_vol_hot  = false; changed = true; }
+    }
+
+    if (edge && lx >= MODE_BOX_X0 && lx < MODE_BOX_X1 &&
+        ly >= MODE_BOX_Y0 && ly < MODE_BOX_Y1) {
+        /* WFM/NFM badge: tap toggles the demodulation standard. */
+        toggle_mode();
+        s_mode_hot = true;
+        dragging = false;
+        changed = true;
+    } else if (edge && lx >= FREQ_BOX_X0 && lx < FREQ_BOX_X1 &&
+               ly >= FREQ_BOX_Y0 && ly < FREQ_BOX_Y1) {
+        /* Tap the big 7-segment readout to type a frequency directly. */
+        kp_open();
+        dragging = false;
+        changed = true;
+    } else if (pressed && lx >= VOL_ZONE_X0 &&
+               ly >= VOL_BAR_TOP - 16 && ly <= VOL_BAR_BOT + 2) {
+        /* Volume gutter. Tested BEFORE the waterfall branch: the gutter lies
+         * inside the same vertical band, and that branch keys off ly only, so
+         * it would otherwise swallow every touch on the bar.
+         *
+         * The y range matters: the right-hand dBm labels sit at the same x
+         * inside the spectrum band, and without this check tapping a label
+         * would silently change the volume instead of doing nothing. */
+        int lvl = vol_level_from_y(ly);
+        if (lvl != s_vol_level) { set_vol_level(lvl); changed = true; }
+        if (!s_vol_hot) { s_vol_hot = true; changed = true; }
+        dragging = false;
+    } else if (pressed && ly >= SPEC_Y0 && ly < WF_Y0 + WF_H) {
+        /* Spectrum or waterfall: drag to slide the frequency, or tap to jump. */
+        if (edge) {
+            dragging = true;
+            moved = false;
+            drag_x0 = lx;
+            tap_x = lx;
+            drag_f0 = s_center;
+            changed = true;
+        } else if (dragging && lx != drag_x0) {
+            /* Do not tune until the finger has clearly committed to a drag.
+             * Otherwise a slightly shaky tap would retune by a few kHz and then
+             * the release would jump again — two conflicting actions. */
+            if (!moved && (lx > drag_x0 ? lx - drag_x0 : drag_x0 - lx) >= TAP_SLOP) {
+                moved = true;
+                drag_x0 = lx;      /* re-baseline so crossing the slop is smooth */
+                drag_f0 = s_center;
+            }
+            if (!moved) goto touch_done;
+
+            /* Pulling the trace to the right means the receiver moves DOWN in
+             * frequency, so the drag delta is subtracted. */
+            int64_t want = (int64_t)drag_f0 - (int64_t)(lx - drag_x0) * DRAG_HZ_PER_PX;
+            int64_t delta = want - (int64_t)s_center;
+            if (delta < 0) delta = -delta;
+            if (delta >= MIN_TUNE_STEP_HZ) {
+                tune_live(want);
+                changed = true;
+            }
         }
     } else if (edge) {
         dragging = false;
-        if (hit(&B_TDN, lx, ly)) { retune((int64_t)s_center - STEPS[s_step_i]); changed = true; }
-        else if (hit(&B_TUP, lx, ly)) { retune((int64_t)s_center + STEPS[s_step_i]); changed = true; }
-        else if (hit(&B_STEP, lx, ly)) { s_step_i = (s_step_i + 1) % N_STEPS; changed = true; }
-        else if (hit(&B_MODE, lx, ly)) {
-            set_mode(!s_nfm);
-            s_label = s_nfm ? "manual NFM" : "WFM broadcast";
-            changed = true;
-        } else if (hit(&B_WX, lx, ly)) {
-            s_wx = (s_wx + 1) % BM_WX_N; select_bookmark(&BM_WX[s_wx]); changed = true;
-        } else if (hit(&B_FDNY, lx, ly)) {
-            s_fdny = (s_fdny + 1) % BM_FDNY_N; select_bookmark(&BM_FDNY[s_fdny]); changed = true;
-        } else if (hit(&B_EMS, lx, ly)) {
-            s_ems = (s_ems + 1) % BM_EMS_N; select_bookmark(&BM_EMS[s_ems]); changed = true;
-        } else if (hit(&B_VDN, lx, ly)) {
-            s_volume -= VOL_STEP; if (s_volume < 0) s_volume = 0;
-            audio_set_volume(s_volume); changed = true;
-        } else if (hit(&B_VUP, lx, ly)) {
-            s_volume += VOL_STEP; if (s_volume > 100) s_volume = 100;
-            audio_set_volume(s_volume); changed = true;
-        } else if (hit(&B_SDN, lx, ly)) {
-            s_squelch -= SQ_STEP; if (s_squelch < -60) s_squelch = -60;
-            apply_squelch(); changed = true;
-        } else if (hit(&B_SUP, lx, ly)) {
-            s_squelch += SQ_STEP; if (s_squelch > 60) s_squelch = 60;
-            apply_squelch(); changed = true;
-        }
     }
 
-    if (!pressed) dragging = false;
+touch_done:
     prev = pressed;
     return changed;
-}
-
-/* ---- present ------------------------------------------------------------- */
-
-static void present(void)
-{
-    ppa_do_scale_rotate_mirror(s_ppa, &(ppa_srm_oper_config_t){
-        .in = { .buffer = LBUF, .pic_w = LW, .pic_h = LH, .block_w = LW, .block_h = LH,
-                .srm_cm = PPA_SRM_COLOR_MODE_RGB565 },
-        .out = { .buffer = bsp_tab5_display_get_frame_buffer(s_fb_index),
-                 .buffer_size = PANEL_W * PANEL_H * 2, .pic_w = PANEL_W, .pic_h = PANEL_H,
-                 .srm_cm = PPA_SRM_COLOR_MODE_RGB565 },
-        .rotation_angle = PPA_SRM_ROTATION_ANGLE_90, .scale_x = SCALE, .scale_y = SCALE,
-    });
-    bsp_tab5_display_flush(s_fb_index);
-    s_fb_index ^= 1;
 }
 
 static void ui_task(void *arg)
 {
     (void)arg;
     rect(0, 0, LW, LH, COL_BG);
-    rect(0, WF_Y0, LW, WF_H, RGB565(0, 0, 0));
-    draw_controls();
+    rect(PLOT_X0, WF_Y0, PLOT_W, WF_H, COL_BG);
     draw_header();
+    draw_volume();
+    draw_footer();
+    draw_graticule();
     present();
 
     const float *last = NULL;
     int bins = dsp_spectrum_bins();
-    int meter_div = 0;
+    int stale = 0;        /* loops since the last new spectrum frame  */
+    int hdr_div = 0;      /* header refresh divider (~4 Hz)           */
+    int frames = 0;       /* frames counted in the current second     */
+    int64_t sec0 = esp_timer_get_time();
+    int idle_repaint = 0; /* keeps the no-dongle screen alive         */
+    int64_t bat_next = 0; /* next battery poll (I2C is not free)      */
+    int64_t orient_next = 0; /* next IMU poll (shares the I2C bus)    */
+    bool no_shown = false;
+
     while (1) {
-        bool dirty = handle_touch();
+        /* Battery: the INA226 needs a couple of I2C transactions, so poll it on
+         * a wall-clock schedule instead of once per frame. */
+        if (esp_timer_get_time() >= bat_next) {
+            bat_next = esp_timer_get_time() + 2000000; /* every 2 s */
+            bsp_tab5_battery_read(&s_bat);
+            s_redraw = true;
+        }
+
+        /* Orientation: 10 Hz is plenty for a screen flip and keeps I2C traffic
+         * (shared with the touch controller and the IMU itself) low. The poll
+         * returns true only when the flip state actually changed, so a stable
+         * device causes no repaints. */
+        if (esp_timer_get_time() >= orient_next) {
+            orient_next = esp_timer_get_time() + 100000; /* every 100 ms */
+            if (bsp_tab5_orientation_poll()) {
+                bsp_tab5_orient_t o;
+                bsp_tab5_orientation_get(&o);
+                s_flipped = o.flipped;
+                /* The buffer content is still valid; only the mapping onto the
+                 * panel changed, so a plain present() is enough. */
+                present();
+            }
+        }
+
+        /* ---- modal keypad ------------------------------------------------ */
+        /* While it is open nothing else may draw: the waterfall scrolls in place
+         * inside this same buffer, so a live update would push the panel pixels
+         * downwards as if they were history. */
+        if (s_kp_open) {
+            static bool painted;
+            bool ch = handle_touch(); /* may close the panel via OK / CANCEL */
+            if (s_kp_open) {
+                if (ch || !painted) { draw_keypad(); present(); painted = true; }
+            } else {
+                painted = false; /* closed: rebuild the live screen next pass */
+            }
+            vTaskDelay(pdMS_TO_TICKS(8));
+            continue;
+        }
+
+        /* Panel just closed: it had painted over the whole buffer, so rebuild
+         * the static furniture. The next spectrum frame refills the plot. */
+        if (s_kp_closed) {
+            s_kp_closed = false;
+            rect(0, 0, LW, LH, COL_BG);
+            rect(PLOT_X0, WF_Y0, PLOT_W, WF_H, COL_BG);
+            draw_graticule();
+            draw_ruler();
+            draw_header();
+            draw_volume();
+            draw_footer();
+            present();
+        }
+
         const float *spec = dsp_spectrum();
         bool newspec = spec && spec != last;
+        bool touched = handle_touch();
+
         if (newspec) {
             last = spec;
+            stale = 0;
+            frames++;
+            if (esp_timer_get_time() - sec0 >= 1000000) {
+                s_fps = frames;
+                frames = 0;
+                sec0 = esp_timer_get_time();
+                s_redraw = true;
+            }
             draw_spectrum(spec, bins);
-            if (++meter_div >= 4) { meter_div = 0; draw_header(); }
+            /* The header carries live readings (SIG, FPS, DROP, REF) and must
+             * agree with the dBm labels just painted — repaint it when the
+             * rounded reference level moves, or every 5 frames otherwise. */
+            int ref_now = (int)lroundf(s_ref_db);
+            if (s_redraw || ref_now != s_ref_shown || ++hdr_div >= 5) {
+                s_redraw = false;
+                s_ref_shown = ref_now;
+                hdr_div = 0;
+                draw_header();
+            }
+            if (no_shown) { no_shown = false; draw_footer(); }
+        } else if (stale < 1000) {
+            stale++;
         }
-        if (dirty) { draw_controls(); draw_header(); }
-        if (newspec || dirty) present();
+
+        /* No spectrum for >~0.5 s. That is the NORMAL state when the dongle is
+         * absent — this port is shared with the flashing/serial link. Report
+         * it plainly and keep the header ticking so the screen is obviously
+         * alive rather than frozen. */
+        if (stale > 62) {
+            if (!no_shown || ++idle_repaint >= 62) {
+                no_shown = true;
+                idle_repaint = 0;
+                draw_header();
+                if (!sdr_is_present()) {
+                    text_c(LW / 2, WF_Y0 + WF_H / 2 - 12, 2, COL_YELLOW, "NO RTL-SDR");
+                    text_c(LW / 2, WF_Y0 + WF_H / 2 + 12, 1, COL_DIM,
+                           "plug the dongle into the USB-A port");
+                } else {
+                    text_c(LW / 2, WF_Y0 + WF_H / 2, 2, COL_RED, "NO DATA - CHECK USB");
+                }
+                draw_footer();
+                present();
+            }
+        }
+
+        /* A gesture can change the mode badge, the tuned frequency or the
+         * volume. This must NOT be gated on !newspec: while the dongle is
+         * streaming, almost every iteration produces a new spectrum frame, so
+         * a volume drag would never repaint. Header and volume strip are cheap
+         * (they do not touch the waterfall), so redraw them on any touch. */
+        if (touched) {
+            draw_header();
+            draw_volume();
+        }
+
+        if (newspec || touched) present();
         vTaskDelay(pdMS_TO_TICKS(8));
     }
 }
@@ -435,13 +1318,45 @@ void ui_start(void)
     LBUF = heap_caps_malloc((size_t)LW * LH * 2, MALLOC_CAP_SPIRAM);
     if (!LBUF) { ESP_LOGE(TAG, "no PSRAM for landscape buffer"); return; }
     ESP_ERROR_CHECK(ppa_register_client(&(ppa_client_config_t){ .oper_type = PPA_OPERATION_SRM }, &s_ppa));
+    build_wlut();
 
     sdr_stats_t st;
     sdr_get_stats(&st);
     s_center = st.center_freq;
-    audio_set_volume(s_volume);
-    apply_squelch();
+    s_mode = dsp_get_mode();
+    audio_set_volume(s_vol_level * 100 / VOL_SEGS);
 
-    ESP_LOGI(TAG, "landscape UI %dx%d (PPA x%d)", LW, LH, SCALE);
+    ESP_LOGI(TAG, "spectrum console %dx%d (PPA x%d, display-only)", LW, LH, SCALE);
     xTaskCreatePinnedToCore(ui_task, "ui", 8192, NULL, 6, NULL, 0);
+}
+
+/* ---- external control hooks (no touch panel in this build) ---------------- */
+
+void ui_set_freq(uint32_t hz)
+{
+    if (hz < FREQ_MIN) hz = FREQ_MIN;
+    if (hz > FREQ_MAX) hz = FREQ_MAX;
+    s_center = hz;
+    sdr_set_center_freq(hz);
+    dsp_flush_spectrum(); /* drop the half-mixed frame from the old frequency */
+    s_redraw = true;
+}
+
+uint32_t ui_get_freq(void) { return s_center; }
+
+void ui_set_mode(int mode)
+{
+    if (mode < DSP_MODE_WFM || mode >= DSP_MODE_COUNT) mode = DSP_MODE_WFM;
+    s_mode = mode;
+    dsp_set_mode(s_mode);
+    s_redraw = true;
+}
+
+void ui_set_volume(int vol)
+{
+    if (vol < 0) vol = 0;
+    if (vol > 100) vol = 100;
+    /* Map the 0..100 range onto the 8 discrete steps. */
+    set_vol_level((vol * VOL_SEGS + 50) / 100);
+    s_redraw = true;
 }

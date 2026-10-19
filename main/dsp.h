@@ -14,16 +14,28 @@ extern "C" {
 /* Start the IQ-processing task. Call after sdr_stream_start(). */
 void dsp_start(void);
 
-/* Demod mode: 0 = wideband FM (broadcast), 1 = narrowband FM (NOAA / public
- * safety voice). Changes the decimation chain + audio shaping. */
-void dsp_set_mode(int nfm);
+/* Demodulation modes. */
+#define DSP_MODE_WFM 0 /* wideband FM (broadcast)                            */
+#define DSP_MODE_NFM 1 /* narrowband FM (NOAA / public safety voice)         */
+#define DSP_MODE_AM  2 /* amplitude modulation (airband 118-137 MHz)         */
+#define DSP_MODE_COUNT 3
+
+/* Select the demodulator. Changes the decimation chain + audio shaping. */
+void dsp_set_mode(int mode);
 int dsp_get_mode(void);
 
 /* Number of spectrum bins exposed (fftshifted: index 0 = lowest freq). */
 int dsp_spectrum_bins(void);
 
-/* Pointer to the latest spectrum frame (dB per bin), or NULL if none yet.
- * Valid until the next frame; read-only. */
+/* Pointer to the latest spectrum frame (NOMINAL dBm per bin), or NULL if none
+ * yet. Valid until the next frame; read-only.
+ *
+ * The values already carry the dBm offset (see SPECTRUM_DBM_OFFSET in dsp.c), so
+ * callers can plot or label them directly. They are not calibrated: use them for
+ * relative comparison, not absolute level measurement.
+ *
+ * Note this is a DIFFERENT scale from dsp_signal_db(), which is demodulated IF
+ * power in raw dB. Do not mix the two. */
 const float *dsp_spectrum(void);
 
 /* Squelch: mute audio when the signal level falls below `db`. Use a very low
@@ -31,8 +43,18 @@ const float *dsp_spectrum(void);
 void dsp_set_squelch_db(float db);
 float dsp_get_squelch_db(void);
 
-/* Current smoothed signal level (dB, same scale as the squelch threshold). */
+/* Current smoothed signal level (dB, same scale as the squelch threshold).
+ * This is demodulated IF power, NOT the dsp_spectrum() dBm scale. */
 float dsp_signal_db(void);
+
+/* Drop the in-progress spectrum accumulation (e.g. after a retune) so the next
+ * frame contains only data from the NEW frequency. Also makes dsp_spectrum()
+ * return NULL until the next snapshot lands. */
+void dsp_flush_spectrum(void);
+
+/* Tracked noise floor (dB, same scale as dsp_signal_db): falls fast, rises
+ * slowly — used by the auto-scan to judge occupancy without a squelch set. */
+float dsp_noise_floor_db(void);
 
 #ifdef __cplusplus
 }

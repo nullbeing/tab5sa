@@ -195,6 +195,11 @@ esp_err_t pi4io_get_all_inputs(pi4io_t pi4io, uint8_t *value) {
     return pi4io_read_reg(pi4io, PI4IO_REG_IN_STA, value);
 }
 
+esp_err_t pi4io_get_all_outputs(pi4io_t pi4io, uint8_t *value) {
+    if (pi4io == NULL || value == NULL) return ESP_ERR_INVALID_ARG;
+    return pi4io_read_reg(pi4io, PI4IO_REG_OUT_SET, value);
+}
+
 esp_err_t pi4io_get_irq_status(pi4io_t pi4io, uint8_t *status) {
     if (pi4io == NULL || status == NULL) return ESP_ERR_INVALID_ARG;
     return pi4io_read_reg(pi4io, PI4IO_REG_IRQ_STA, status);

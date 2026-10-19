@@ -33,4 +33,7 @@ esp_err_t pi4io_deinit(pi4io_t pi4io);
 esp_err_t pi4io_set_output(pi4io_t pi4io, uint8_t pin, bool value);
 esp_err_t pi4io_get_input(pi4io_t pi4io, uint8_t pin, bool *value);
 esp_err_t pi4io_get_all_inputs(pi4io_t pi4io, uint8_t *value);
+/* Read the OUT_SET register back from the chip (not the cached value), so a
+ * silently failed write is visible. */
+esp_err_t pi4io_get_all_outputs(pi4io_t pi4io, uint8_t *value);
 esp_err_t pi4io_get_irq_status(pi4io_t pi4io, uint8_t *status);

@@ -5,16 +5,20 @@
 
 #include "bsp_private.h"
 #include "bsp_tab5.h"
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
 #include "esp_codec_dev.h"
+#include "esp_timer.h"
 #include "esp_codec_dev_defaults.h"
 #include "es8388_codec.h"
 #include "misc/bsp_display.h"
 #include "pi4io/pi4io.h"
+#include "ina226/ina226.h"
+#include "bmi270/bmi270.h"
 #include "ili9881c/ili9881c.h"
 #include "gt911/gt911.h"
 #include "st7123/st7123_lcd.h"
@@ -44,6 +48,18 @@ static ili9881c_lcd_t ili9881c;
 static gt911_touch_t gt911;
 static st7123_lcd_t st7123_lcd;
 static st7123_touch_t st7123_touch;
+
+/* Battery monitor (U31 INA226 across the 5 mOhm shunt R39). Optional: stays
+ * NULL when the part is absent or does not answer. */
+static ina226_t ina226;
+static bool charge_enabled = true;
+
+/* Orientation (U19 BMI270). Optional: stays NULL when the part is absent. */
+static bmi270_t bmi270;
+static bool orient_flipped;               /* current reported state        */
+static bool orient_ref_valid;             /* upright direction known yet?  */
+static int32_t orient_ref_x, orient_ref_y; /* in-plane gravity when upright */
+static int16_t orient_ax, orient_ay, orient_az;
 
 esp_err_t bsp_tab5_init(const bsp_tab5_config_t *config) {
     esp_err_t err;
@@ -81,10 +97,26 @@ esp_err_t bsp_tab5_init(const bsp_tab5_config_t *config) {
         [3] = { PI4IO_PIN_MODE_OUTPUT, .initial_value = false },  // USB5V_EN
         [4] = { PI4IO_PIN_MODE_OUTPUT, .initial_value = false },  // PWROFF_PLUSE
         [5] = { PI4IO_PIN_MODE_OUTPUT, .initial_value = false },  // nCHG_QC_EN
-        [6] = { PI4IO_PIN_MODE_INPUT },                           // CHG_STAT
-        [7] = { PI4IO_PIN_MODE_OUTPUT, .initial_value = false },  // CHG_EN
+        [6] = { PI4IO_PIN_MODE_INPUT,  .pull = PI4IO_PULL_UP },   // CHG_STAT
+        // CHG_EN must be HIGH from boot. Unlike a plain ESP32 dev board, the
+        // Tab5 charges its 2S pack through an IP2326 whose enable line is
+        // driven from here — leaving it low means the device never charges,
+        // however long it stays plugged in.
+        [7] = { PI4IO_PIN_MODE_OUTPUT, .initial_value = true },   // CHG_EN
     }, &pi4ioe2);
     BSP_RETURN_ERR(err);
+    charge_enabled = true;
+
+    /* Battery monitor: probe the INA226. A missing part is not fatal — the UI
+     * simply reports no battery data. */
+    if (ina226_init(i2c0, &ina226) != ESP_OK) {
+        ESP_LOGW(TAG, "no INA226 battery monitor; voltage/current unavailable");
+    }
+
+    /* Orientation: non-fatal. Without an IMU the screen simply never flips. */
+    if (bsp_tab5_orientation_init() != ESP_OK) {
+        ESP_LOGW(TAG, "no BMI270; screen flip disabled");
+    }
 
     // Reset Touch Panel and LCD
     gpio_reset_pin(GPIO_NUM_23);
@@ -290,6 +322,90 @@ void bsp_tab5_set_usb_host_power(bool on) {
     pi4io_set_output(pi4ioe2, 3, on);
 }
 
+// MARK: Battery / charging
+void bsp_tab5_set_charge_enable(bool on) {
+    // PI4IOE2 (0x44) pin 7 = CHG_EN -> IP2326 enable.
+    if (!pi4ioe2) return;
+    if (pi4io_set_output(pi4ioe2, 7, on) == ESP_OK) charge_enabled = on;
+}
+
+bool bsp_tab5_charge_enabled(void) { return charge_enabled; }
+
+/* 2S Li-ion pack: map pack voltage to a rough state of charge. The curve is
+ * the usual resting-voltage approximation — it is not coulomb counting, so it
+ * sags under load and reads low while the dongle is drawing current. */
+static int pack_percent(int32_t mv)
+{
+    static const struct { int32_t mv; int pct; } CURVE[] = {
+        {8400, 100}, {8200, 92}, {8000, 85}, {7800, 70}, {7600, 55},
+        {7400, 40},  {7200, 25}, {7000, 12}, {6800, 5},  {6400, 0},
+    };
+    const int n = BSP_ARRAY_SIZE(CURVE);
+    if (mv >= CURVE[0].mv) return 100;
+    if (mv <= CURVE[n - 1].mv) return 0;
+    for (int i = 0; i < n - 1; i++) {
+        if (mv <= CURVE[i].mv && mv >= CURVE[i + 1].mv) {
+            int32_t hi = CURVE[i].mv, lo = CURVE[i + 1].mv;
+            int phi = CURVE[i].pct, plo = CURVE[i + 1].pct;
+            int32_t span = hi - lo;
+            if (span <= 0) return plo;
+            return plo + (int)((int32_t)(phi - plo) * (mv - lo) / span);
+        }
+    }
+    return 0;
+}
+
+void bsp_tab5_battery_read(bsp_tab5_battery_t *out) {
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+
+    bool external = false;
+    if (pi4ioe2) {
+        bool stat = false;
+        /* PI4IOE2 bit6 is the IP2326 status/USB-C-detect line. The M5Stack BSP
+         * reads it as "USB-C present" (high = present), so treat it as the
+         * external-power flag rather than as "charging". */
+        if (pi4io_get_input(pi4ioe2, 6, &stat) == ESP_OK) external = stat;
+    }
+    out->external = external;
+
+    if (!ina226) {
+        out->present = false;
+        return;
+    }
+
+    int32_t mv = 0;
+    float ma = 0;
+    if (ina226_bus_mv(ina226, &mv) != ESP_OK) return;
+    /* A failed current read must NOT be reported as 0 mA: that looks like a
+     * perfectly idle pack and hides an I2C fault. Keep present=false instead. */
+    if (ina226_current_ma(ina226, &ma) != ESP_OK) return;
+
+    out->present = true;
+    out->mv = mv;
+    out->ma = ma;
+    out->percent = pack_percent(mv);
+    /* Only call it "charging" when external power is present AND a real
+     * current is flowing through the pack shunt. With the board powered from
+     * a plain 5 V USB port the IP2326 can sit idle (0 mA), and reporting that
+     * as "charging" would be a lie. */
+    float abs_ma = ma < 0 ? -ma : ma;
+    out->charging = external && abs_ma > 30.0f;
+}
+
+void bsp_tab5_battery_dump(void) {
+    uint8_t in = 0, out = 0;
+    if (pi4ioe2) {
+        pi4io_get_all_inputs(pi4ioe2, &in);
+        /* OUT_SET read back from the chip, not the cached value: proves the
+         * CHG_EN write actually landed instead of silently failing. */
+        pi4io_get_all_outputs(pi4ioe2, &out);
+    }
+    ESP_LOGI(TAG, "pi4ioe2 in=0x%02X (bit6 CHG_STAT=%d) out=0x%02X (bit7 CHG_EN=%d, want %d)",
+             in, (in >> 6) & 1, out, (out >> 7) & 1, (int)charge_enabled);
+    ina226_dump(ina226);
+}
+
 // MARK: Display
 void bsp_tab5_display_set_brightness(int brightness) {
     if (ili9881c) ili9881c_lcd_set_brightness(ili9881c, brightness);
@@ -312,4 +428,166 @@ int bsp_tab5_touch_read(esp_lcd_touch_point_data_t *points, uint8_t max_points) 
 void bsp_tab5_touch_wait_interrupt(void) {
     if (gt911) gt911_touch_wait_interrupt(gt911);
     if (st7123_touch) st7123_touch_wait_interrupt(st7123_touch);
+}
+
+// MARK: Orientation (BMI270)
+/*
+ * "Upside down" is judged from gravity *inside the plane of the screen*.
+ *
+ * Held in landscape the panel is roughly vertical, so the in-plane component
+ * (x,y) points towards the floor. Turning the device over in its own plane
+ * reverses that vector — which is exactly the "screen is upside down" case.
+ * Comparing a direction rather than one hard-coded axis means no assumption
+ * about how the sensor is mounted: whatever orientation the device was in when
+ * the reference was learned is taken as upright, and everything is relative.
+ *
+ * Lying flat on a desk the in-plane component is ~0, and gravity then carries no
+ * information about in-plane rotation. That is physically undetectable, so the
+ * last state is held instead of being guessed from noise.
+ */
+#define ORIENT_SMOOTH   4    /* EMA divisor for the samples                */
+#define ORIENT_MIN_MG   300  /* in-plane gravity needed to decide anything */
+/* Learning the reference needs a much larger in-plane component than merely
+ * acting on it: when the panel is near flat the in-plane vector is small and
+ * its *direction* is mostly noise, so latching a reference from it would make
+ * later comparisons meaningless. Require the device to be genuinely held up
+ * (which puts ~1 g in plane) before trusting a direction. */
+#define ORIENT_LATCH_MG 600
+
+static int32_t orient_ema[3];
+static int16_t orient_rx, orient_ry, orient_rz;
+
+static void orient_read_raw(int16_t *x, int16_t *y, int16_t *z)
+{
+    *x = *y = *z = 0;
+    if (bmi270) {
+        bmi270_accel_mg(bmi270, x, y, z);
+        bmi270_accel_raw(bmi270, &orient_rx, &orient_ry, &orient_rz);
+    }
+    orient_ax = *x;
+    orient_ay = *y;
+    orient_az = *z;
+}
+
+static bool orient_inplane_significant(int32_t x, int32_t y)
+{
+    return x * x + y * y >= ORIENT_MIN_MG * ORIENT_MIN_MG;
+}
+
+static bool orient_inplane_strong(int32_t x, int32_t y)
+{
+    return x * x + y * y >= ORIENT_LATCH_MG * ORIENT_LATCH_MG;
+}
+
+esp_err_t bsp_tab5_orientation_init(void)
+{
+    if (bmi270_init(i2c0, &bmi270) != ESP_OK) return ESP_ERR_NOT_FOUND;
+
+    /* Average a few samples: one reading is noisy and would bias the reference
+     * for the rest of the session. */
+    int32_t sx = 0, sy = 0, sz = 0;
+    for (int i = 0; i < 8; i++) {
+        int16_t x, y, z;
+        orient_read_raw(&x, &y, &z);
+        sx += x; sy += y; sz += z;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    orient_ema[0] = sx / 8;
+    orient_ema[1] = sy / 8;
+    orient_ema[2] = sz / 8;
+
+    if (orient_inplane_strong(orient_ema[0], orient_ema[1])) {
+        orient_ref_x = orient_ema[0];
+        orient_ref_y = orient_ema[1];
+        orient_ref_valid = true;
+        ESP_LOGI(TAG, "orientation reference %+ld/%+ld mg (this is upright)",
+                 (long)orient_ref_x, (long)orient_ref_y);
+    } else {
+        /* Booted flat or at an angle. The in-plane direction is only meaningful
+         * once the device is held up, so learn it then rather than locking in
+         * noise that would mis-flip the screen later. */
+        ESP_LOGI(TAG, "booted flat (%+ld/%+ld mg); reference latched on pickup",
+                 (long)orient_ema[0], (long)orient_ema[1]);
+    }
+
+    orient_flipped = false;
+    return ESP_OK;
+}
+
+bool bsp_tab5_orientation_poll(void)
+{
+    if (!bmi270) {
+        /* A boot whose 8 KiB config upload failed would otherwise leave the
+         * screen flip dead until the next reset. Retry a few times in the
+         * background so the feature heals itself. Deliberately bounded: each
+         * attempt blocks for ~1 s (the upload), so this must not run forever. */
+        static int64_t next_try;
+        static int tries;
+        int64_t now = esp_timer_get_time();
+        if (tries < 3 && now >= next_try) {
+            tries++;
+            next_try = now + 8000000; /* 8 s apart */
+            if (bsp_tab5_orientation_init() == ESP_OK) {
+                ESP_LOGI(TAG, "IMU recovered on background retry %d", tries);
+            }
+        }
+        return false;
+    }
+
+    int16_t x, y, z;
+    orient_read_raw(&x, &y, &z);
+    if (x == 0 && y == 0 && z == 0) return false; /* no sample yet */
+
+    orient_ema[0] += ((int32_t)x - orient_ema[0]) / ORIENT_SMOOTH;
+    orient_ema[1] += ((int32_t)y - orient_ema[1]) / ORIENT_SMOOTH;
+    orient_ema[2] += ((int32_t)z - orient_ema[2]) / ORIENT_SMOOTH;
+
+    int32_t cx = orient_ema[0], cy = orient_ema[1];
+
+    /* Flat on a desk: no in-plane gravity, so no in-plane orientation. */
+    if (!orient_inplane_significant(cx, cy)) return false;
+
+    if (!orient_ref_valid) {
+        /* Wait for a trustworthy direction before learning "upright". */
+        if (!orient_inplane_strong(cx, cy)) return false;
+        orient_ref_x = cx;
+        orient_ref_y = cy;
+        orient_ref_valid = true;
+        ESP_LOGI(TAG, "orientation reference %+ld/%+ld mg (this is upright)",
+                 (long)cx, (long)cy);
+        return false;
+    }
+
+    int32_t r2 = orient_ref_x * orient_ref_x + orient_ref_y * orient_ref_y;
+    int64_t dot = (int64_t)cx * orient_ref_x + (int64_t)cy * orient_ref_y;
+    int64_t tot = (int64_t)(cx * cx + cy * cy) * r2; /* |cur|^2 * |ref|^2 */
+
+    bool was = orient_flipped;
+    /* cos(angle) = dot / sqrt(tot).
+     *   flip   once the direction is >120 deg away (dot < 0 and
+     *          4*dot^2 > tot, i.e. cos < -0.5)
+     *   unflip as soon as it comes back within 90 deg (dot > 0)
+     * The gap between those two thresholds is the dead band that keeps the
+     * screen from flickering while the device is tilted through the middle. */
+    if (!orient_flipped) {
+        if (dot < 0 && 4 * dot * dot > tot) orient_flipped = true;
+    } else {
+        if (dot > 0) orient_flipped = false;
+    }
+
+    return orient_flipped != was;
+}
+
+void bsp_tab5_orientation_get(bsp_tab5_orient_t *out)
+{
+    if (!out) return;
+    out->present = (bmi270 != NULL);
+    out->flipped = orient_flipped;
+    out->ax = orient_ax;
+    out->ay = orient_ay;
+    out->az = orient_az;
+    out->rx = orient_rx;
+    out->ry = orient_ry;
+    out->rz = orient_rz;
+    out->range = bmi270_accel_range(bmi270);
 }

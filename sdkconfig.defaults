@@ -4,6 +4,12 @@ CONFIG_IDF_TARGET="esp32p4"
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 
+# This Tab5's ESP32-P4 is silicon revision v1.0 (an early batch). IDF v5.5
+# defaults the bootloader to require rev >= v3.01, which refuses to flash.
+# Pin the minimum revision to v1.0 so the image matches the real chip.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
 # PSRAM — the IQ ring buffer and waterfall history live here.
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_SPEED_200M=y
@@ -13,6 +19,13 @@ CONFIG_SPIRAM_MEMTEST=n
 # controller must stay enabled even though the SDR app doesn't use BT.
 CONFIG_BT_ENABLED=y
 CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+
+# NOTE: leave CONFIG_FREERTOS_HZ at its default 100. Bumping it to 1000 was
+# observed to stall the RTL-SDR stream (no IQ ever arrived, NO DATA on screen):
+# components/librtlsdr/src/libusb.c calls vTaskDelay(1 / portTICK_PERIOD_MS),
+# which integer-divides to 0 (a bare yield) at 100 Hz but to 1 tick — a real
+# 1 ms sleep — at 1000 Hz, throttling USB event pumping. Fix that idiom first
+# if a finer tick is ever needed.
 
 # esp_hosted link to the on-board ESP32-C6 (Wi-Fi/BT coprocessor) over SDIO.
 CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_LOW=y

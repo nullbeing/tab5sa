@@ -1,3 +1,11 @@
+/*
+ * Local (Tab5-SDR) modifications to the vendored libusb shim:
+ *  - <string.h> include for GCC 14 (below).
+ *  - uh_daemon / uh_client pinned to core 1: they are the USB event pumps for
+ *    the RTL-SDR stream, which also lives on core 1 (stream_task, iq_proc).
+ *    Leaving them unpinned let the scheduler migrate them onto core 0, where
+ *    their priority (10) pre-empted the UI task (6).
+ */
 #include <libusb.h>
 #include <string.h> /* memcpy — GCC 14 errors on the implicit declaration */
 #define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
@@ -10,6 +18,9 @@ int usbhost_initok=0;
 
 void usbhost_begin()
 {
+	/* Failure here must NOT hang the boot: the dongle is optional and the UI
+	 * has to come up regardless. Report and leave usbhost_initok at 0, which
+	 * makes every librtlsdr entry point report "no device". */
 	const usb_host_config_t config = {
 		.skip_phy_setup = false,
 		.intr_flags = ESP_INTR_FLAG_LEVEL1,
@@ -17,10 +28,12 @@ void usbhost_begin()
 	esp_err_t err = usb_host_install(&config);
 	if (err != ESP_OK) {
 		ESP_LOGE("libusb", "usb_host_install() err=%x", err);
-	  } else {
+		return;
+	} else {
 		ESP_LOGD("libusb", "usb_host_install() ESP_OK");
-	  }
-	  const usb_host_client_config_t client_config = {
+	}
+
+	const usb_host_client_config_t client_config = {
 		.is_synchronous = false,
 		.max_num_event_msg = 10,
 		.async = {
@@ -29,49 +42,45 @@ void usbhost_begin()
 		}
 	  };
 
-	  err = usb_host_client_register(&client_config, &uh_handle);
-	  if (err != ESP_OK) {
+	err = usb_host_client_register(&client_config, &uh_handle);
+	if (err != ESP_OK) {
 		ESP_LOGE("libusb", "usb_host_client_register() err=%x", err);
-	  } else {
+		return;
+	} else {
 		ESP_LOGD("libusb", "usb_host_client_register() ESP_OK");
-	  }
+	}
 
-	  TaskHandle_t taskHandle = NULL;
-	  BaseType_t taskStatus = xTaskCreate(
+	TaskHandle_t taskHandle = NULL;
+	BaseType_t taskStatus = xTaskCreate(
 		usbhost_daemon_task,
 		"uh_daemon",
 		10000,
 		NULL,
 		10,
 		&taskHandle
-	  );
-	
-	  if (taskStatus != pdPASS) {
-		ESP_LOGE("libusb","Error creating uh daemon task!");
-		while (1) { 
-			vTaskDelay(1000 / portTICK_PERIOD_MS); 
-		}
-	  }
+	);
 
-	  TaskHandle_t taskHandle2 = NULL;
-	  BaseType_t taskStatus2 = xTaskCreate(
+	if (taskStatus != pdPASS) {
+		ESP_LOGE("libusb", "Error creating uh daemon task!");
+		return;
+	}
+
+	TaskHandle_t taskHandle2 = NULL;
+	BaseType_t taskStatus2 = xTaskCreate(
 		usbhost_one_client_task,
 		"uh_client",
 		10000,
 		NULL,
 		10,
 		&taskHandle2
-	  );
-	
-	  if (taskStatus2 != pdPASS) {
-		ESP_LOGE("libusb","Error creating uh client task!");
-		while (1) { 
- 		   vTaskDelay(1000 / portTICK_PERIOD_MS); 
-		}
-	  }
+	);
 
+	if (taskStatus2 != pdPASS) {
+		ESP_LOGE("libusb", "Error creating uh client task!");
+		return;
+	}
 
-	  usbhost_initok = 1;
+	usbhost_initok = 1;
 }
 	
 void usbhost_clientEventCallback(const usb_host_client_event_msg_t *eventMsg, void *arg) {
@@ -105,8 +114,11 @@ void usbhost_one_client_task(){
 }
 
 
+/* Callers test `libusb_init() < 0` to bail out. usbhost_initok is 0 when the
+ * host stack failed to come up, so returning it raw made every caller proceed
+ * with a NULL uh_handle and crash. Report failure as -1 instead. */
 int libusb_init(){
-	return usbhost_initok;
+	return usbhost_initok ? 0 : -1;
 }
 
 void  libusb_exit(){

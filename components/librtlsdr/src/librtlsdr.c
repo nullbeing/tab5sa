@@ -1289,44 +1289,46 @@ static rtlsdr_dongle_t *find_known_device(uint16_t vid, uint16_t pid)
 /*+*/
 uint32_t rtlsdr_get_device_count(void)
 {
-	int i,r;
+	int i;
 	uint32_t device_count = 0;
-	r = libusb_init();
-	if(r < 0)
+	if (libusb_init() < 0)
 		return 0;
+
 	usb_host_lib_info_t info;
-	usb_host_lib_info(&info);
+	if (usb_host_lib_info(&info) != ESP_OK)
+		return 0;
 	int num_dev = info.num_devices;
-	uint8_t *dev_addr_list;
-	int num_dev_ret;
-	if (num_dev==0){
-		ESP_LOGE(TAG, "num_dev = 0");
+	if (num_dev <= 0) {
+		ESP_LOGD(TAG, "no USB devices present");
 		return 0;
 	}
 
-	dev_addr_list = malloc(num_dev);
+	uint8_t *dev_addr_list = malloc(num_dev);
+	if (!dev_addr_list)
+		return 0;
 
+	int num_dev_ret = 0;
 	esp_err_t err = usb_host_device_addr_list_fill(num_dev, dev_addr_list, &num_dev_ret);
 	if (err != ESP_OK) {
 		ESP_LOGE(TAG, "dc: usb_host_device_addr_list_fill ERR, num_dev=%d", num_dev);
-    } else {
-		ESP_LOGV(TAG, "dc: usb_host_device_addr_list_fill ESP_OK num_dev_ret=%d", num_dev_ret);
-    }
-	
-	for (i = 0; i < num_dev_ret; i++) {
-		usb_device_handle_t dev_hdl;
-		esp_err_t err = usb_host_device_open(uh_handle,dev_addr_list[i], &dev_hdl);
-		if (err != ESP_OK) {
-			ESP_LOGE(TAG, "dc: usb_host_device_open ERR");
-		} else {
-			ESP_LOGD(TAG, "dc: usb_host_device_open ESP_OK");
-		}
-		const usb_device_desc_t *dd;
-		usb_host_get_device_descriptor(dev_hdl, &dd);
+		free(dev_addr_list);
+		return 0;
+	}
+	if (num_dev_ret > num_dev) num_dev_ret = num_dev; /* never trust the count */
 
-		if (find_known_device(dd->idVendor, dd->idProduct))
+	for (i = 0; i < num_dev_ret; i++) {
+		usb_device_handle_t dev_hdl = NULL;
+		if (usb_host_device_open(uh_handle, dev_addr_list[i], &dev_hdl) != ESP_OK || !dev_hdl) {
+			ESP_LOGD(TAG, "dc: usb_host_device_open ERR (addr %d)", dev_addr_list[i]);
+			continue;
+		}
+
+		const usb_device_desc_t *dd = NULL;
+		if (usb_host_get_device_descriptor(dev_hdl, &dd) == ESP_OK && dd &&
+		    find_known_device(dd->idVendor, dd->idProduct))
 			device_count++;
-		usb_host_device_close(uh_handle,dev_hdl);			
+
+		usb_host_device_close(uh_handle, dev_hdl);
 	}
 	free(dev_addr_list);
 
@@ -1337,54 +1339,53 @@ uint32_t rtlsdr_get_device_count(void)
 /*+*/
 int rtlsdr_get_device_usb_strings(uint32_t index, char *manufact, char *product, char *serial)
 {
-	int i,r=-2;
+	int i, r = -2;
 	uint32_t device_count = 0;
-	r = libusb_init();
-	if(r < 0)
-		return r;
+	if (libusb_init() < 0)
+		return -1;
+
 	usb_host_lib_info_t info;
-	usb_host_lib_info(&info);
+	if (usb_host_lib_info(&info) != ESP_OK)
+		return -2;
 	int num_dev = info.num_devices;
-	uint8_t *dev_addr_list;
-	int num_dev_ret;
-	if (num_dev==0){
-		ESP_LOGE(TAG, "num_dev = 0");
+	if (num_dev <= 0)
+		return -2;
+
+	uint8_t *dev_addr_list = malloc(num_dev);
+	if (!dev_addr_list)
+		return -2;
+
+	int num_dev_ret = 0;
+	if (usb_host_device_addr_list_fill(num_dev, dev_addr_list, &num_dev_ret) != ESP_OK) {
+		ESP_LOGE(TAG, "us: usb_host_device_addr_list_fill ERR, num_dev=%d", num_dev);
+		free(dev_addr_list);
 		return -2;
 	}
+	if (num_dev_ret > num_dev) num_dev_ret = num_dev;
 
-	dev_addr_list = malloc(num_dev);
-
-	esp_err_t err = usb_host_device_addr_list_fill(num_dev, dev_addr_list, &num_dev_ret);
-	if (err != ESP_OK) {
-		ESP_LOGE(TAG, "us: usb_host_device_addr_list_fill ERR, num_dev=%d", num_dev);
-    } else {
-		ESP_LOGV(TAG, "us: usb_host_device_addr_list_fill ESP_OK num_dev_ret=%d", num_dev_ret);
-    }
-	
 	for (i = 0; i < num_dev_ret; i++) {
-		usb_device_handle_t dev_hdl;
-		esp_err_t err = usb_host_device_open(uh_handle,dev_addr_list[i], &dev_hdl);
-		if (err != ESP_OK) {
-			ESP_LOGE(TAG, "us: usb_host_device_open ERR");
-		} else {
-			ESP_LOGD(TAG, "us: usb_host_device_open ESP_OK");
-		}
-		const usb_device_desc_t *dd;
-		usb_host_get_device_descriptor(dev_hdl, &dd);
+		usb_device_handle_t dev_hdl = NULL;
+		if (usb_host_device_open(uh_handle, dev_addr_list[i], &dev_hdl) != ESP_OK || !dev_hdl)
+			continue;
 
-		if (find_known_device(dd->idVendor, dd->idProduct)){
-			device_count++;
-			if (index == device_count-1){
-				usb_device_info_t dev_info;
-				usb_host_device_info(dev_hdl, &dev_info);
-				getUsbDescString(dev_info.str_desc_manufacturer, manufact);
-				getUsbDescString(dev_info.str_desc_product, product);
-				getUsbDescString(dev_info.str_desc_serial_num, serial);
-				usb_host_device_close(uh_handle,dev_hdl);							
-				break;
-			}
+		const usb_device_desc_t *dd = NULL;
+		if (usb_host_get_device_descriptor(dev_hdl, &dd) != ESP_OK || !dd ||
+		    !find_known_device(dd->idVendor, dd->idProduct)) {
+			usb_host_device_close(uh_handle, dev_hdl);
+			continue;
 		}
-		usb_host_device_close(uh_handle,dev_hdl);							
+
+		if (index == device_count++) {
+			usb_device_info_t dev_info;
+			usb_host_device_info(dev_hdl, &dev_info);
+			getUsbDescString(dev_info.str_desc_manufacturer, manufact);
+			getUsbDescString(dev_info.str_desc_product, product);
+			getUsbDescString(dev_info.str_desc_serial_num, serial);
+			r = 0;
+			usb_host_device_close(uh_handle, dev_hdl);
+			break;
+		}
+		usb_host_device_close(uh_handle, dev_hdl);
 	}
 	free(dev_addr_list);
 	return r;
@@ -1394,59 +1395,47 @@ int rtlsdr_get_device_usb_strings(uint32_t index, char *manufact, char *product,
 /*+*/
 const char *rtlsdr_get_device_name(uint32_t index)
 {
-	int i,r=-2;
+	int i;
 	uint32_t device_count = 0;
-	rtlsdr_dongle_t *device = NULL;
-	r = libusb_init();
-	if(r < 0)
+	if (libusb_init() < 0)
 		return "none";
+
 	usb_host_lib_info_t info;
-	usb_host_lib_info(&info);
+	if (usb_host_lib_info(&info) != ESP_OK)
+		return "none";
 	int num_dev = info.num_devices;
-	uint8_t *dev_addr_list;
-	int num_dev_ret;
-	if (num_dev==0){
-		ESP_LOGE(TAG, "dn:  num_dev = 0");
+	if (num_dev <= 0)
+		return "none";
+
+	uint8_t *dev_addr_list = malloc(num_dev);
+	if (!dev_addr_list)
+		return "none";
+
+	int num_dev_ret = 0;
+	if (usb_host_device_addr_list_fill(num_dev, dev_addr_list, &num_dev_ret) != ESP_OK) {
+		ESP_LOGE(TAG, "dn: usb_host_device_addr_list_fill ERR, num_dev=%d", num_dev);
+		free(dev_addr_list);
 		return "none";
 	}
+	if (num_dev_ret > num_dev) num_dev_ret = num_dev;
 
-	dev_addr_list = malloc(num_dev);
-
-	esp_err_t err = usb_host_device_addr_list_fill(num_dev, dev_addr_list, &num_dev_ret);
-	if (err != ESP_OK) {
-		ESP_LOGE(TAG, "dn: usb_host_device_addr_list_fill ERR, num_dev=%d", num_dev);
-    } else {
-		ESP_LOGV(TAG, "dn: usb_host_device_addr_list_fill ESP_OK num_dev_ret=%d", num_dev_ret);
-    }
-	
 	for (i = 0; i < num_dev_ret; i++) {
-		usb_device_handle_t dev_hdl;
-		esp_err_t err = usb_host_device_open(uh_handle,dev_addr_list[i], &dev_hdl);
-		if (err != ESP_OK) {
-			ESP_LOGE(TAG, "dn:  usb_host_device_open ERR");
-		} else {
-			ESP_LOGD(TAG, "dn: usb_host_device_open ESP_OK");
-		}
-		const usb_device_desc_t *dd;
-		usb_host_get_device_descriptor(dev_hdl, &dd);
+		usb_device_handle_t dev_hdl = NULL;
+		if (usb_host_device_open(uh_handle, dev_addr_list[i], &dev_hdl) != ESP_OK || !dev_hdl)
+			continue;
 
-		device = find_known_device(dd->idVendor, dd->idProduct);
-		
-		if (device){
-			device_count++;
-			if (index == device_count-1){
-				break;
-			}
-		}
+		const usb_device_desc_t *dd = NULL;
+		rtlsdr_dongle_t *device = NULL;
+		if (usb_host_get_device_descriptor(dev_hdl, &dd) == ESP_OK && dd)
+			device = find_known_device(dd->idVendor, dd->idProduct);
 
-		usb_host_device_close(uh_handle,dev_hdl);			
+		usb_host_device_close(uh_handle, dev_hdl);
+
+		if (device && index == device_count++)
+			return device->name;
 	}
 	free(dev_addr_list);
-	
-	if (device)
-		return device->name;
-	else
-		return "";	
+	return "";
 }
 
 
@@ -1488,13 +1477,17 @@ int rtlsdr_check_dongle_model(void *dev, char *manufact_check, char *product_che
 
 int rtlsdr_open(rtlsdr_dev_t **out_dev, uint32_t index)
 {
-	int r;
+	int r = -1;
 	int i;
 	rtlsdr_dev_t *dev = NULL;
 	uint8_t device = 0;
 	uint32_t device_count = 0;
 	uint8_t reg;
 	ssize_t cnt;
+
+	if (!out_dev)
+		return -EINVAL;
+	*out_dev = NULL;
 
 	dev = malloc(sizeof(rtlsdr_dev_t));
 	if (NULL == dev)
@@ -1503,8 +1496,7 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint32_t index)
 	memset(dev, 0, sizeof(rtlsdr_dev_t));
 	memcpy(dev->fir, fir_default, sizeof(fir_default));
 
-	r = libusb_init();
-	if(r < 0){
+	if (libusb_init() < 0) {
 		free(dev);
 		return -1;
 	}
@@ -1512,49 +1504,55 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint32_t index)
 	dev->dev_lost = 1;
 
 	usb_host_lib_info_t info;
-	usb_host_lib_info(&info);
+	if (usb_host_lib_info(&info) != ESP_OK) {
+		ESP_LOGE(TAG, "ro: usb_host_lib_info failed");
+		goto err;
+	}
 	int num_dev = info.num_devices;
-	uint8_t *dev_addr_list;
-	int num_dev_ret;
-	if (num_dev==0){
-		ESP_LOGE(TAG, "ro: num_dev = 0");
-		return -2;
+	if (num_dev <= 0) {
+		ESP_LOGD(TAG, "ro: no USB devices present");
+		r = -2;
+		goto err;
 	}
 
-	dev_addr_list = malloc(num_dev);
+	uint8_t *dev_addr_list = malloc(num_dev);
+	if (!dev_addr_list) {
+		r = -ENOMEM;
+		goto err;
+	}
 
-	esp_err_t err = usb_host_device_addr_list_fill(num_dev, dev_addr_list, &num_dev_ret);
-	if (err != ESP_OK) {
+	int num_dev_ret = 0;
+	if (usb_host_device_addr_list_fill(num_dev, dev_addr_list, &num_dev_ret) != ESP_OK) {
 		ESP_LOGE(TAG, "ro: usb_host_device_addr_list_fill ERR, num_dev=%d", num_dev);
-    } else {
-		ESP_LOGV(TAG, "ro: usb_host_device_addr_list_fill ESP_OK num_dev_ret=%d", num_dev_ret);
-    }
-	
-	//usb_device_handle_t dev_hdl;
-	
-	for (i = 0; i < num_dev_ret; i++) {
-		device = dev_addr_list[i];	
-		esp_err_t err = usb_host_device_open(uh_handle,device, &dev->devh);
-		if (err != ESP_OK) {
-			ESP_LOGE(TAG, "ro: usb_host_device_open ERR");
-		} else {
-			ESP_LOGD(TAG, "ro: usb_host_device_open ESP_OK");
-		}
-		const usb_device_desc_t *dd;
-		usb_host_get_device_descriptor(dev->devh, &dd);
+		free(dev_addr_list);
+		goto err;
+	}
+	if (num_dev_ret > num_dev) num_dev_ret = num_dev; /* never trust the count */
 
-		if (find_known_device(dd->idVendor, dd->idProduct)){
+	for (i = 0; i < num_dev_ret; i++) {
+		usb_device_handle_t devh = NULL;
+		if (usb_host_device_open(uh_handle, dev_addr_list[i], &devh) != ESP_OK || !devh) {
+			ESP_LOGD(TAG, "ro: usb_host_device_open ERR (addr %d)", dev_addr_list[i]);
+			continue;
+		}
+
+		const usb_device_desc_t *dd = NULL;
+		bool known = (usb_host_get_device_descriptor(devh, &dd) == ESP_OK && dd &&
+		              find_known_device(dd->idVendor, dd->idProduct));
+		if (known) {
 			device_count++;
+			if (index == device_count - 1) {
+				dev->devh = devh; /* keep this one open */
+				device = dev_addr_list[i];
+				break;
+			}
 		}
-		if (index == device_count-1){
-			break;
-		}
-		device = 0;
-		usb_host_device_close(uh_handle,dev->devh);			
+		usb_host_device_close(uh_handle, devh);
 	}
 	free(dev_addr_list);
-	
-	if (!device) {
+
+	if (!device || !dev->devh) {
+		ESP_LOGD(TAG, "ro: requested dongle index %u not present", (unsigned)index);
 		r = -1;
 		goto err;
 	}
@@ -1685,6 +1683,12 @@ found:
 	ESP_LOGD("librtlsdr","ro: end");
 	return 0;
 err:
+	if (dev) {
+		if (dev->devh)
+			usb_host_device_close(uh_handle, dev->devh);
+		free(dev);
+	}
+	*out_dev = NULL;
 	return r;
 }
 
