@@ -61,6 +61,61 @@ static bool orient_ref_valid;             /* upright direction known yet?  */
 static int32_t orient_ref_x, orient_ref_y; /* in-plane gravity when upright */
 static int16_t orient_ax, orient_ay, orient_az;
 
+/* Touch controller interrupt / GT911 address-strap pin. */
+#define TOUCH_INT_GPIO GPIO_NUM_23
+
+/*
+ * Reset the touch controller and work out which I2C address it latched.
+ *
+ * The GT911 decides its address from the level of INT at the rising edge of
+ * TP_RST: low -> 0x5D, high -> 0x14. `esp_lcd_touch_gt911` implements exactly
+ * that sequence, but only when it is given a reset GPIO. On the Tab5 TP_RST
+ * lives on the PI4IOE expander, so the driver is handed GPIO_NUM_NC and skips
+ * the whole block — leaving INT to `gpio_reset_pin()`, i.e. floating on the
+ * internal pull-up.
+ *
+ * That is a genuine race: whichever level the pin happens to sit at when RST
+ * releases wins, and it depends on how fast the rails came up. It showed up as
+ * "touch dead after a cold boot, fine after a reset". Driving INT low makes the
+ * latch deterministic (0x5D).
+ *
+ * Retried because the part also needs time to boot before it answers at all;
+ * a single probe on a slow power-up would otherwise look like "no touch".
+ */
+static uint8_t touch_reset_and_probe(void)
+{
+    for (int attempt = 0; attempt < 3; attempt++) {
+        /* Hold INT low across the reset so the address strap reads as 0x5D. */
+        gpio_config(&(gpio_config_t){
+            .pin_bit_mask = 1ULL << TOUCH_INT_GPIO,
+            .mode = GPIO_MODE_OUTPUT,
+        });
+        gpio_set_level(TOUCH_INT_GPIO, 0);
+
+        pi4io_set_output(pi4ioe1, 5, false); /* TP_RST = Low */
+        vTaskDelay(pdMS_TO_TICKS(20));
+        pi4io_set_output(pi4ioe1, 5, true);  /* TP_RST = High: address latched */
+        vTaskDelay(pdMS_TO_TICKS(120));      /* GT911 needs >100 ms to boot */
+
+        /* Hand INT back to the input path the interrupt handler expects.
+         * Keep the pull-up: `gpio_reset_pin()` used to leave one enabled, and
+         * the INT line is open-drain, so without it the edge never arrives. */
+        gpio_config(&(gpio_config_t){
+            .pin_bit_mask = 1ULL << TOUCH_INT_GPIO,
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+        });
+
+        if (i2c_master_probe(i2c0, GT911_I2C_ADDR_PRIMARY, 50) == ESP_OK)
+            return GT911_I2C_ADDR_PRIMARY;
+        if (i2c_master_probe(i2c0, GT911_I2C_ADDR_BACKUP, 50) == ESP_OK)
+            return GT911_I2C_ADDR_BACKUP;
+
+        ESP_LOGW(TAG, "touch: no GT911 after reset (attempt %d)", attempt + 1);
+    }
+    return 0;
+}
+
 esp_err_t bsp_tab5_init(const bsp_tab5_config_t *config) {
     esp_err_t err;
 
@@ -118,13 +173,11 @@ esp_err_t bsp_tab5_init(const bsp_tab5_config_t *config) {
         ESP_LOGW(TAG, "no BMI270; screen flip disabled");
     }
 
-    // Reset Touch Panel and LCD
-    gpio_reset_pin(GPIO_NUM_23);
+    /* Reset the LCD. Touch reset is handled separately: the GT911 needs its INT
+     * pin driven while TP_RST is released (see touch_reset_and_probe). */
     pi4io_set_output(pi4ioe1, 4, false);  // LCD_RST = Low
-    pi4io_set_output(pi4ioe1, 5, false);  // TP_RST = Low
     vTaskDelay(pdMS_TO_TICKS(100));
     pi4io_set_output(pi4ioe1, 4, true);   // LCD_RST = High
-    pi4io_set_output(pi4ioe1, 5, true);   // TP_RST = High
     vTaskDelay(pdMS_TO_TICKS(100));
 
     /*
@@ -138,13 +191,14 @@ esp_err_t bsp_tab5_init(const bsp_tab5_config_t *config) {
      * that pairing. Log the raw probe results so a bad inference is visible
      * from the serial output instead of having to be guessed at.
      */
-    bool have_st7123_tp = (i2c_master_probe(i2c0, ST7123_TOUCH_I2C_ADDR, 10) == ESP_OK);
+    bool have_st7123_tp = (i2c_master_probe(i2c0, ST7123_TOUCH_I2C_ADDR, 50) == ESP_OK);
 
-    uint8_t gt911_addr = 0;
-    if (i2c_master_probe(i2c0, GT911_I2C_ADDR_PRIMARY, 10) == ESP_OK) {
-        gt911_addr = GT911_I2C_ADDR_PRIMARY;
-    } else if (i2c_master_probe(i2c0, GT911_I2C_ADDR_BACKUP, 10) == ESP_OK) {
-        gt911_addr = GT911_I2C_ADDR_BACKUP;
+    /* Pulses TP_RST, which also resets the ST7123 if that is the fitted part. */
+    uint8_t gt911_addr = touch_reset_and_probe();
+    if (!gt911_addr) {
+        /* The ST7123 does not use the INT strap; re-probe in case the pulse
+         * above brought it up. */
+        have_st7123_tp = (i2c_master_probe(i2c0, ST7123_TOUCH_I2C_ADDR, 50) == ESP_OK);
     }
 
     ESP_LOGI(TAG, "touch probe: st7123@0x%02x=%s gt911@0x%02x=%s gt911@0x%02x=%s",
@@ -196,7 +250,7 @@ esp_err_t bsp_tab5_init(const bsp_tab5_config_t *config) {
         err = st7123_touch_init(&(st7123_touch_config_t){
             .i2c_bus = i2c0,
             .size = (bsp_size_t){ 720, 1280 },
-            .int_gpio = GPIO_NUM_23,
+            .int_gpio = TOUCH_INT_GPIO,
             .rst_gpio = GPIO_NUM_NC,
             .scl_speed_hz = 100000,
             .interrupt = config->touch.interrupt,
@@ -206,7 +260,7 @@ esp_err_t bsp_tab5_init(const bsp_tab5_config_t *config) {
         err = gt911_touch_init(&(gt911_touch_config_t){
             .i2c_bus = i2c0,
             .size = (bsp_size_t){ 720, 1280 },
-            .int_gpio = GPIO_NUM_23,
+            .int_gpio = TOUCH_INT_GPIO,
             .rst_gpio = GPIO_NUM_NC,
             .scl_speed_hz = 100000,
             .interrupt = config->touch.interrupt,
