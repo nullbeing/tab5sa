@@ -1084,7 +1084,7 @@ static void draw_footer(void)
     hline(0, FOOT_Y, LW, COL_GRID);
     text(8, FOOT_Y + 5, 1, COL_DIM, "TAB5-SA  RTL2832U");
     text_c(LW / 2, FOOT_Y + 5, 1, COL_DIM, "SPECTRUM / WATERFALL");
-    text_r(632, FOOT_Y + 5, 1, COL_DIM, "TUNE:TAP/DRAG  MODE:TAP  VOL:RIGHT");
+    text_r(632, FOOT_Y + 5, 1, COL_DIM, "TUNE:TAP/DRAG  MODE:TAP");
 }
 
 /* ---- present ------------------------------------------------------------- */
