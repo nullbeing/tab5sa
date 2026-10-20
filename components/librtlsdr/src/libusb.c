@@ -250,8 +250,21 @@ int getUsbDescString(const usb_str_desc_t *str_desc, char * str) {
 	if (str_desc == NULL) {
 		return -1;
 	}
-	int j =0;
-	for (int i = 0; i < str_desc->bLength / 2; i++) {
+	/* bLength counts the whole descriptor, including the 2-byte
+	 * (bLength, bDescriptorType) header, so the character count is
+	 * (bLength - 2) / 2. Looping to bLength / 2 read one character past the
+	 * end and appended whatever happened to sit in the next two bytes.
+	 *
+	 * That is not a cosmetic problem: it made strcmp() against "Blog V4" fail,
+	 * so an RTL-SDR Blog V4 was treated as a plain R828D, got the 16 MHz
+	 * crystal instead of 28.8 MHz, and every tune landed 1.8x off frequency —
+	 * a spectrum full of noise and no stations. It went unnoticed because the
+	 * adjacent byte is often 0x00, which terminates the string "correctly". */
+	int nchars = (str_desc->bLength - 2) / 2;
+	if (nchars < 0) nchars = 0;
+
+	int j = 0;
+	for (int i = 0; i < nchars; i++) {
 	  if (str_desc->wData[i] > 0xFF) {
 		continue;
 	  }
