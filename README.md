@@ -4,7 +4,7 @@ A handheld **spectrum analyzer + SDR receiver** running entirely on an
 **M5Stack Tab5** (ESP32-P4). Plug an RTL-SDR dongle into the USB-A port and get a
 live spectrum, waterfall, touch tuning and demodulated audio — no PC needed.
 
-![Tab5SA running on the M5Stack Tab5](screenshot.jpg)
+![Tab5SA running on the M5Stack Tab5](screenshot.png)
 
 Forked from [Tab5-SDR](https://github.com/hardparking/Tab5-SDR), largely reworked.
 

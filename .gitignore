@@ -17,8 +17,9 @@ sdkconfig.old
 __pycache__/
 *.pyc
 
-# Default output of tools/shot.py when run without -o
-screenshot.png
+# Default output of tools/shot.py when run without -o. Scoped to tools/ so the
+# README screenshot at the repo root stays tracked.
+tools/screenshot.png
 
 .DS_Store
 
