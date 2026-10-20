@@ -1581,8 +1581,28 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint32_t index)
 
 
 
-	/* Get device manufacturer and product id */
-	//r = rtlsdr_get_usb_strings(dev, dev->manufact, dev->product, NULL);
+	/* Get device manufacturer and product id.
+	 *
+	 * This used to call rtlsdr_get_usb_strings(), which this ESP-IDF port does
+	 * not implement (only the index-based rtlsdr_get_device_usb_strings()
+	 * exists), so the call was commented out. But dev->manufact/product are what
+	 * rtlsdr_check_dongle_model() compares against, and dev is memset to zero at
+	 * open — so the comparison always failed and every R828D was treated as a
+	 * non-V4 stick.
+	 *
+	 * That matters because the R828D branch below picks the tuner crystal from
+	 * it: a V4 runs 28.8 MHz and other R828D sticks 16 MHz. With the strings
+	 * empty, a V4 got 16 MHz, the PLL was off by 1.8x, and the receiver tuned
+	 * the wrong frequency entirely — spectrum full of noise, no signals.
+	 *
+	 * Read the descriptors straight from the handle that is already open. */
+	if (dev->devh) {
+		usb_device_info_t dev_info;
+		if (usb_host_device_info(dev->devh, &dev_info) == ESP_OK) {
+			getUsbDescString(dev_info.str_desc_manufacturer, dev->manufact);
+			getUsbDescString(dev_info.str_desc_product, dev->product);
+		}
+	}
 
 	/* Probe tuners */
 	ESP_LOGI("librtlsdr","ro:  probe tuners");
@@ -1671,6 +1691,13 @@ found:
 	default:
 		break;
 	}
+
+	/* One line that answers "why does this dongle not tune?" without a
+	 * recompile: which tuner was probed, which strings were read, and the crystal
+	 * the PLL will use. The R828D/V4 case hinges on all three agreeing. */
+	ESP_LOGI(TAG, "tuner=%d manuf=\"%s\" product=\"%s\" rtl_xtal=%u tun_xtal=%u",
+	         (int)dev->tuner_type, dev->manufact, dev->product,
+	         (unsigned)dev->rtl_xtal, (unsigned)dev->tun_xtal);
 
 	ESP_LOGD(TAG,"tuner init");
 	if (dev->tuner->init)
