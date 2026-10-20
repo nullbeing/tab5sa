@@ -6,6 +6,8 @@ live spectrum, waterfall, touch tuning and demodulated audio — no PC needed.
 
 ![Tab5SA running on the M5Stack Tab5](screenshot.png)
 
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/D0U028IVM4)
+
 Forked from [Tab5-SDR](https://github.com/hardparking/Tab5-SDR), largely reworked.
 
 ## Specs
