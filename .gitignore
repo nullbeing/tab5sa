@@ -23,6 +23,9 @@ tools/screenshot.png
 
 .DS_Store
 
+# Local release binaries built from this tree (not for distribution in the repo)
+firmware/
+
 # Local flash dumps (32MB factory image)
 backup/
 
