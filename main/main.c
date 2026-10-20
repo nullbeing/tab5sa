@@ -15,6 +15,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_app_desc.h"
 
 #include "bsp_tab5.h"
 #include "sdr.h"
@@ -54,7 +55,8 @@ static void draw_test_pattern(void)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Tab5-SDR boot — free heap %" PRIu32 ", PSRAM %u",
+    ESP_LOGI(TAG, "Tab5SA %s boot — free heap %" PRIu32 ", PSRAM %u",
+             esp_app_get_description()->version,
              esp_get_free_heap_size(), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     ESP_ERROR_CHECK(bsp_tab5_init(&(bsp_tab5_config_t){
