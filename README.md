@@ -10,8 +10,6 @@ If you find this useful and would like to support the work, you can buy me a cof
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/D0U028IVM4)
 
-Forked from [Tab5-SDR](https://github.com/hardparking/Tab5-SDR), largely reworked.
-
 ## Specs
 
 | Item | Value |
@@ -101,6 +99,8 @@ without a flash cycle.
 720x1280 RGB565 frame, saved as PNG). No extra wiring.
 
 ## Credits & license
+
+Forked from [Tab5-SDR](https://github.com/hardparking/Tab5-SDR), largely reworked.
 
 **GPL-2.0-or-later** (see [LICENSE](LICENSE)), as required by librtlsdr.
 
