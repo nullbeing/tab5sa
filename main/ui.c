@@ -160,10 +160,11 @@ static const char *TAG = "ui";
 /* Same window as the keypad, on purpose: two modal panels that land in
  * different places would read as two unrelated features. */
 #define FAV_MAX      8
-#define FAV_ROW_Y0   (KP_Y0 + 40)          /* below the title bar      */
-#define FAV_ROW_H    28
+#define FAV_ROW_Y0   (KP_Y0 + 50)          /* below the title band     */
+#define FAV_ROW_H    27
 #define FAV_LIST_H   (FAV_MAX * FAV_ROW_H)
-#define FAV_DEL_W    22                    /* per-row delete target    */
+#define FAV_DEL_W    20                    /* per-row delete target    */
+#define FAV_CLOSE_W  20                    /* title-bar close target   */
 /* Footer slot that used to say "SPECTRUM / WATERFALL". Kept as the entry point
  * because that text was decoration; the favourites list is worth the space. */
 #define FAV_BTN_X0   250
@@ -1267,19 +1268,30 @@ static void fav_dispatch(int hit)
 
 static int fav_hit(int lx, int ly)
 {
+    const int rx = KP_X0 + KP_PAD;
+    const int rw = KP_W - 2 * KP_PAD;
+
     if (ly >= FAV_ROW_Y0 && ly < FAV_ROW_Y0 + FAV_MAX * FAV_ROW_H) {
         int row = (ly - FAV_ROW_Y0) / FAV_ROW_H;
         if (row >= s_fav_n) return FAV_HIT_NONE; /* empty slot: nothing to hit */
 
-        int dx = KP_X0 + KP_W - KP_PAD - FAV_DEL_W;
-        if (lx >= dx && lx < dx + FAV_DEL_W) return FAV_HIT_DEL(row);
-        if (lx >= KP_X0 + KP_PAD && lx < KP_X0 + KP_W - KP_PAD) return row;
+        /* Delete target centred on the drawn cross, not the whole row end:
+         * a wide invisible target here would swallow taps meant for the row. */
+        int dx = rx + rw - FAV_DEL_W / 2 - 2;
+        if (lx >= dx - FAV_DEL_W / 2 && lx < dx + FAV_DEL_W / 2)
+            return FAV_HIT_DEL(row);
+        if (lx >= rx && lx < rx + rw) return row;
         return FAV_HIT_NONE;
     }
 
-    if (ly >= KP_Y0 && ly < KP_Y0 + 34) {
-        int cx = KP_X0 + KP_W - 30;
-        if (lx >= cx && lx < KP_X0 + KP_W - 4) return FAV_HIT_CLOSE;
+    /* Title-band close cross. The target is a square around the glyph, so it
+     * stays easy to hit on glass while looking like a 9 px mark. */
+    if (ly >= KP_Y0 && ly < KP_Y0 + 33) {
+        int cx = KP_X0 + KP_W - FAV_CLOSE_W / 2 - 6;
+        int cy = KP_Y0 + 16;
+        if (lx >= cx - FAV_CLOSE_W / 2 && lx < cx + FAV_CLOSE_W / 2 &&
+            ly >= cy - FAV_CLOSE_W / 2 && ly < cy + FAV_CLOSE_W / 2)
+            return FAV_HIT_CLOSE;
     }
 
     if (ly >= KP_BTN_Y && ly < KP_BTN_Y + KP_BTN_H) {
@@ -1287,7 +1299,7 @@ static int fav_hit(int lx, int ly)
         if (lx >= bx && lx < bx + KP_BTN_W) return FAV_HIT_SAVE;
         /* Second button is CLOSE. It is drawn by draw_favorites() and must have
          * a matching hit region: without this the visible button does nothing
-         * and only the small "X" in the title bar can dismiss the panel. */
+         * and only the small cross in the title band can dismiss the panel. */
         int cx2 = bx + KP_BTN_W + KP_GAP;
         if (lx >= cx2 && lx < cx2 + KP_BTN_W) return FAV_HIT_CLOSE;
     }
@@ -1306,18 +1318,39 @@ static void fav_mode_style(int mode, const char **lab, uint16_t *col)
     }
 }
 
-/* Five-pointed star, filled. The bitmap font only covers ' '..'~', so the mark
- * has to be drawn rather than typed. */
-static void draw_star(int cx, int cy, int r, uint16_t c)
+/* Five-pointed star, from a bitmap.
+ *
+ * It used to be a 10-vertex polygon filled by scanline. At the sizes this
+ * appears (9 px) that fails visibly: the two bottom legs round into a single
+ * trapezoid and the notch between them disappears, because a 10 px tall shape
+ * cannot resolve ten vertices. A hand-placed bitmap is crisp at every size and
+ * costs less than the trigonometry did.
+ *
+ * `sc` scales it in whole pixels; 1 is the normal size. */
+static void draw_star(int cx, int cy, int sc, uint16_t c)
 {
-    int px[10], py[10];
-    for (int i = 0; i < 10; i++) {
-        float a = -1.5707963f + (float)i * 3.14159265f / 5.0f;
-        int rr = (i & 1) ? r / 2 : r;
-        px[i] = cx + (int)lroundf(cosf(a) * (float)rr);
-        py[i] = cy + (int)lroundf(sinf(a) * (float)rr);
+    /* 9x9, bit 8 = leftmost column. Row 3 is the pair of side points; rows 6-8
+     * open the notch between the two legs. */
+    static const uint16_t ROW[9] = {
+        0x010, 0x038, 0x038, 0x1FF, 0x0FE, 0x07C, 0x06C, 0x0C6, 0x183,
+    };
+    int x0 = cx - 4 * sc, y0 = cy - 4 * sc;
+    for (int r = 0; r < 9; r++)
+        for (int b = 0; b < 9; b++)
+            if (ROW[r] & (1u << (8 - b)))
+                rect(x0 + b * sc, y0 + r * sc, sc, sc, c);
+}
+
+/* A drawn cross. Symmetric and centred on a pixel, so it reads the same at any
+ * size — unlike the font's 'X', whose strokes are one pixel and off-centre. */
+static void draw_x(int cx, int cy, int r, uint16_t c)
+{
+    for (int i = -r; i <= r; i++) {
+        int a = cx + i, b = cy + i;
+        if (a >= 0 && a < LW && b >= 0 && b < LH) LBUF[(size_t)b * LW + a] = c;
+        b = cy - i;
+        if (a >= 0 && a < LW && b >= 0 && b < LH) LBUF[(size_t)b * LW + a] = c;
     }
-    poly(px, py, 10, c);
 }
 
 static void draw_favorites(void)
@@ -1326,73 +1359,112 @@ static void draw_favorites(void)
      * inside this same buffer, so an overlay would be dragged down as history.
      * The keypad learned this the hard way; see draw_keypad(). */
     rect(0, 0, LW, LH, COL_BG);
-    rect(KP_X0, KP_Y0, KP_W, KP_H, COL_BG);
-    hline(KP_X0, KP_Y0, KP_W, COL_CYAN);
-    hline(KP_X0, KP_Y0 + KP_H - 1, KP_W, COL_CYAN);
-    vline(KP_X0, KP_Y0, KP_H, COL_CYAN);
-    vline(KP_X0 + KP_W - 1, KP_Y0, KP_H, COL_CYAN);
 
-    const int midx = KP_X0 + KP_W / 2;
+    /* --- panel frame ----------------------------------------------------- */
+    const int px0 = KP_X0, py0 = KP_Y0, pw = KP_W, ph = KP_H;
+    rect(px0, py0, pw, ph, COL_BG);
+    hline(px0, py0, pw, COL_CYAN);
+    hline(px0, py0 + ph - 1, pw, COL_CYAN);
+    vline(px0, py0, ph, COL_CYAN);
+    vline(px0 + pw - 1, py0, ph, COL_CYAN);
 
-    /* --- title bar ------------------------------------------------------- */
-    draw_star(KP_X0 + KP_PAD + 5, KP_Y0 + 14, 7, COL_CURSOR);
-    text(KP_X0 + KP_PAD + 16, KP_Y0 + 8, 2, COL_WHITE, "FAVORITES");
-    text_r(KP_X0 + KP_W - 16, KP_Y0 + 12, 1,
-           (s_fav_hot == FAV_HIT_CLOSE) ? COL_RED : COL_DIM, "X");
+    const int midx = px0 + pw / 2;
 
+    /* --- title band ------------------------------------------------------ */
+    const int tband_h = 32;
+    rect(px0 + 1, py0 + 1, pw - 2, tband_h, RGB565(0, 18, 10));
+    hline(px0 + 1, py0 + tband_h + 1, pw - 2, COL_GRID);
+
+    draw_star(px0 + KP_PAD + 6, py0 + 16, 1, COL_CURSOR);
+    text(px0 + KP_PAD + 16, py0 + 12, 2, COL_WHITE, "FAVORITES");
+
+    /* Close control: a drawn cross in a small square target. The font's 'X' at
+     * 5x7 reads as a letter, and a bare glyph has no press feedback. */
+    {
+        bool hc = (s_fav_hot == FAV_HIT_CLOSE);
+        int cx = px0 + pw - FAV_CLOSE_W / 2 - 6;
+        int cy = py0 + tband_h / 2 + 1;
+        if (hc)
+            rect(cx - FAV_CLOSE_W / 2, cy - FAV_CLOSE_W / 2, FAV_CLOSE_W, FAV_CLOSE_W,
+                 RGB565(60, 16, 16));
+        draw_x(cx, cy, 4, hc ? COL_RED : COL_DIM);
+    }
+
+    /* --- empty state ----------------------------------------------------- */
     if (s_fav_n == 0) {
-        text_c(midx, FAV_ROW_Y0 + 56, 1, COL_DIM, "NO FAVORITES YET");
-        text_c(midx, FAV_ROW_Y0 + 74, 1, COL_DIM, "hold the frequency to save");
+        int cy = FAV_ROW_Y0 + FAV_MAX * FAV_ROW_H / 2 - 26;
+        draw_star(midx, cy, 2, RGB565(46, 40, 16));
+        text_c(midx, cy + 26, 1, COL_DIM, "NO FAVORITES YET");
+        text_c(midx, cy + 42, 1, RGB565(60, 72, 60), "hold the frequency to save");
     }
 
     /* --- rows ------------------------------------------------------------ */
     for (int i = 0; i < FAV_MAX; i++) {
         int y = FAV_ROW_Y0 + i * FAV_ROW_H;
+        int rx = px0 + KP_PAD;
+        int rw = pw - 2 * KP_PAD;
 
         if (i >= s_fav_n) {
-            /* Empty slot: a hairline only, so the eight-slot capacity stays
-             * visible without pretending there is content. */
-            hline(KP_X0 + KP_PAD, y + FAV_ROW_H / 2, KP_W - 2 * KP_PAD, COL_GRIDV);
+            /* Empty slot: a hairline keeps the eight-slot capacity visible
+             * without pretending there is content. */
+            hline(rx, y + FAV_ROW_H / 2, rw, COL_GRIDV);
             continue;
         }
 
         bool cur = (s_fav[i].hz == s_center && s_fav[i].mode == (uint8_t)s_mode);
         bool hot = (s_fav_hot == i);
-        uint16_t bg = hot ? COL_GREEN : (cur ? COL_CURSOR : RGB565(0, 26, 14));
-        uint16_t fg = (hot || cur) ? COL_BG : COL_GREEN;
 
-        rect(KP_X0 + KP_PAD, y, KP_W - 2 * KP_PAD, FAV_ROW_H - 3, bg);
+        /* Fill only on press. A permanently filled row for "current" made the
+         * list look like eight buttons with one stuck on; a 2 px accent bar
+         * says the same thing and leaves the text at full contrast. */
+        uint16_t bg = hot ? COL_GREEN : RGB565(0, 20, 12);
+        uint16_t fg_idx = hot ? COL_BG : COL_DIM;
+        uint16_t fg_frq = hot ? COL_BG : (cur ? COL_CURSOR : COL_WHITE);
+
+        rect(rx, y, rw, FAV_ROW_H - 3, bg);
+        if (cur && !hot) vline(rx, y, FAV_ROW_H - 3, COL_CURSOR);
 
         char b[24];
         snprintf(b, sizeof b, "%d", i + 1);
-        text(KP_X0 + KP_PAD + 6, y + 8, 1, fg, b);
+        text(rx + 7, y + 8, 1, fg_idx, b);
 
         snprintf(b, sizeof b, "%.3f MHz", s_fav[i].hz / 1e6);
-        text(KP_X0 + KP_PAD + 22, y + 8, 1, fg, b);
+        text(rx + 20, y + 8, 1, fg_frq, b);
 
         const char *lab;
         uint16_t mc;
         fav_mode_style(s_fav[i].mode, &lab, &mc);
-        text(KP_X0 + KP_PAD + 140, y + 8, 1, (hot || cur) ? COL_BG : mc, lab);
+        text_r(rx + rw - FAV_DEL_W - 10, y + 8, 1, hot ? COL_BG : mc, lab);
 
-        /* Per-row delete. Small on purpose: it sits beside the row's own tap
-         * target, so it must be hard to hit by accident. */
-        int dx = KP_X0 + KP_W - KP_PAD - FAV_DEL_W;
+        /* Per-row delete: a small cross, dim until pressed. It sits beside the
+         * row's own tap target, so it must be hard to hit by accident. */
+        int dx = rx + rw - FAV_DEL_W / 2 - 2;
         bool dh = (s_fav_hot == FAV_HIT_DEL(i));
-        rect(dx, y + 3, FAV_DEL_W, FAV_ROW_H - 9, dh ? COL_RED : RGB565(40, 12, 12));
-        text_c(dx + FAV_DEL_W / 2, y + 8, 1, dh ? COL_BG : COL_RED, "X");
+        if (dh)
+            rect(dx - FAV_DEL_W / 2, y + 3, FAV_DEL_W, FAV_ROW_H - 9, RGB565(70, 14, 14));
+        draw_x(dx, y + FAV_ROW_H / 2 - 1, 3, dh ? COL_RED : RGB565(96, 44, 44));
     }
 
     /* --- buttons --------------------------------------------------------- */
-    int bx = KP_X0 + KP_PAD;
+    int bx = px0 + KP_PAD;
+    int by = KP_BTN_Y;
+
     bool hs = (s_fav_hot == FAV_HIT_SAVE);
-    rect(bx, KP_BTN_Y, KP_BTN_W, KP_BTN_H, hs ? COL_GREEN : RGB565(10, 40, 20));
-    text_c(bx + KP_BTN_W / 2, KP_BTN_Y + KP_BTN_H / 2 - 7, 2,
+    rect(bx, by, KP_BTN_W, KP_BTN_H, hs ? COL_GREEN : RGB565(10, 40, 20));
+    hline(bx, by, KP_BTN_W, hs ? COL_GREEN : COL_GREEN);
+    text_c(bx + KP_BTN_W / 2, by + KP_BTN_H / 2 - 7, 2,
            hs ? COL_BG : COL_GREEN, "SAVE");
 
+    /* Secondary action: outlined, not a solid red slab. Red fill is reserved
+     * for destructive confirmation, and closing a list destroys nothing. */
     int cx2 = bx + KP_BTN_W + KP_GAP;
-    rect(cx2, KP_BTN_Y, KP_BTN_W, KP_BTN_H, RGB565(40, 12, 12));
-    text_c(cx2 + KP_BTN_W / 2, KP_BTN_Y + KP_BTN_H / 2 - 7, 2, COL_RED, "CLOSE");
+    bool hcl = (s_fav_hot == FAV_HIT_CLOSE);
+    rect(cx2, by, KP_BTN_W, KP_BTN_H, hcl ? RGB565(70, 14, 14) : RGB565(18, 8, 8));
+    hline(cx2, by, KP_BTN_W, COL_RED);
+    hline(cx2, by + KP_BTN_H - 1, KP_BTN_W, COL_RED);
+    vline(cx2, by, KP_BTN_H, COL_RED);
+    vline(cx2 + KP_BTN_W - 1, by, KP_BTN_H, COL_RED);
+    text_c(cx2 + KP_BTN_W / 2, by + KP_BTN_H / 2 - 7, 2, COL_RED, "CLOSE");
 }
 
 /* ---- footer -------------------------------------------------------------- */
@@ -1406,7 +1478,7 @@ static void draw_footer(void)
     /* Favorites entry point. This slot used to read "SPECTRUM / WATERFALL",
      * which was decoration; a way into the list is worth the space. The count is
      * shown so the button also reports state instead of only being a door. */
-    draw_star(FAV_BTN_X0 + 7, FOOT_Y + 8, 5, s_fav_n ? COL_CURSOR : COL_DIM);
+    draw_star(FAV_BTN_X0 + 7, FOOT_Y + 8, 1, s_fav_n ? COL_CURSOR : COL_DIM);
     char fb[20];
     snprintf(fb, sizeof fb, "FAV %d/%d", s_fav_n, FAV_MAX);
     text(FAV_BTN_X0 + 17, FOOT_Y + 5, 1, s_fav_n ? COL_CURSOR : COL_DIM, fb);
