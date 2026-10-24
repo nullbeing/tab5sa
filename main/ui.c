@@ -28,6 +28,8 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "driver/ppa.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 
 #include "bsp_tab5.h"
 #include "sdr.h"
@@ -154,6 +156,21 @@ static const char *TAG = "ui";
 #define FREQ_BOX_Y0   8
 #define FREQ_BOX_Y1  52
 
+/* ---- favorites panel ----------------------------------------------------- */
+/* Same window as the keypad, on purpose: two modal panels that land in
+ * different places would read as two unrelated features. */
+#define FAV_MAX      8
+#define FAV_ROW_Y0   (KP_Y0 + 40)          /* below the title bar      */
+#define FAV_ROW_H    28
+#define FAV_LIST_H   (FAV_MAX * FAV_ROW_H)
+#define FAV_DEL_W    22                    /* per-row delete target    */
+/* Footer slot that used to say "SPECTRUM / WATERFALL". Kept as the entry point
+ * because that text was decoration; the favourites list is worth the space. */
+#define FAV_BTN_X0   250
+#define FAV_BTN_X1   390
+#define FAV_BTN_Y0   FOOT_Y
+#define FAV_BTN_Y1   LH
+
 /* ---- theme --------------------------------------------------------------- */
 #define RGB565(r, g, b) \
     ((uint16_t)(((((r) >> 3) & 0x1F) << 11) | ((((g) >> 2) & 0x3F) << 5) | (((b) >> 3) & 0x1F)))
@@ -230,6 +247,28 @@ static char s_kp_buf[24];  /* digits typed, e.g. "121.5"                  */
 static int  s_kp_len;
 static int  s_kp_hot = -1; /* key index under the finger, for feedback     */
 static bool s_kp_closed;   /* overlay just closed: repaint underneath      */
+
+/* Favorites: eight fixed slots, persisted in NVS.
+ *
+ * Each entry stores the demod mode as well as the frequency, because the mode
+ * is band-dependent in practice (WFM on 88-108 MHz, AM on the airband). A list
+ * of bare frequencies would land on the right channel with the wrong demod and
+ * sound like a dead receiver. */
+typedef struct {
+    uint32_t hz;
+    uint8_t  mode;
+} fav_t;
+
+static fav_t s_fav[FAV_MAX];
+static int   s_fav_n;
+static bool  s_fav_open;
+static int   s_fav_hot = -1;  /* hit id under the finger, -1 = none      */
+static bool  s_fav_closed;    /* overlay just closed: rebuild underneath */
+/* Polls the frequency readout has been held. A short tap opens the keypad, a
+ * long one stores the current channel — same tap/hold grammar as the mode
+ * badge, so there is only one long-press idiom to learn. */
+static int   s_freq_hold;
+static bool  s_freq_hot;      /* finger is on the frequency readout        */
 
 static const char *const KP_LABELS[12] = {
     "1", "2", "3",
@@ -786,6 +825,26 @@ static void draw_ruler(void)
         if (tx + text_w(b, 1) > LW - 2) tx = LW - 2 - text_w(b, 1);
         text(tx, RULER_Y + 6, 1, (i == GRID_DIV / 2) ? COL_CURSOR : COL_DIM, b);
     }
+
+    /* Favorites in view: a small triangle above the ruler line.
+     *
+     * Only 1.152 MHz is on screen, so most entries are off scale; this marks the
+     * few that are, which is what makes a saved channel discoverable while
+     * dragging rather than only from the list. Drawn last so nothing can cover
+     * it. The marker does dip a few rows into the bottom of the plot, which is
+     * always noise floor, so it reads as an annotation rather than a signal. */
+    const float half = SDR_DEFAULT_SAMPLE_RATE / 2.0f;
+    for (int i = 0; i < s_fav_n; i++) {
+        float d = (float)s_fav[i].hz - (float)s_center;
+        if (d < -half || d > half) continue;
+        int x = PLOT_X0 + (int)lroundf(((d + half) / (2.0f * half)) * (float)PLOT_W);
+        if (x < PLOT_X0 || x > PLOT_X0 + PLOT_W - 1) continue;
+
+        bool at_cur = (s_fav[i].hz == s_center && s_fav[i].mode == (uint8_t)s_mode);
+        int px[3] = { x - 3, x + 3, x };
+        int py[3] = { RULER_Y - 2, RULER_Y - 2, RULER_Y - 6 };
+        poly(px, py, 3, at_cur ? COL_GREEN : COL_CURSOR);
+    }
 }
 
 static void draw_spectrum(const float *spec, int bins)
@@ -1076,6 +1135,266 @@ static void draw_keypad(void)
            ho ? COL_BG : COL_GREEN, "OK");
 }
 
+/* ---- favorites ----------------------------------------------------------- */
+/*
+ * Eight fixed slots, persisted in NVS.
+ *
+ * An entry carries the demod mode as well as the frequency because the mode is
+ * band-dependent in practice (WFM on 88-108 MHz, AM on the airband). A list of
+ * bare frequencies would tune the right channel with the wrong demod and sound
+ * like a dead receiver — the one failure a shortcut must not have.
+ */
+#define FAV_NVS_NS   "tab5sa"
+#define FAV_NVS_KEY  "favs"
+
+#define FAV_HIT_NONE  (-1)
+#define FAV_HIT_CLOSE  30
+#define FAV_HIT_SAVE   31
+#define FAV_HIT_DEL(i) (20 + (i))
+
+static bool fav_nvs_ready(void)
+{
+    /* Same on-demand pattern as the orientation reference: this build enables
+     * neither WiFi nor BT, so nothing else has brought NVS up. */
+    static int state; /* 0 = untried, 1 = ok, -1 = unavailable */
+    if (state) return state > 0;
+
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        if (nvs_flash_erase() == ESP_OK) err = nvs_flash_init();
+    }
+    state = (err == ESP_OK) ? 1 : -1;
+    if (state < 0) ESP_LOGW(TAG, "NVS unavailable; favorites will not persist");
+    return state > 0;
+}
+
+static void fav_save(void)
+{
+    if (!fav_nvs_ready()) return;
+
+    /* Zero the unused tail so a shrinking list cannot leave a stale entry behind
+     * in the blob. */
+    memset(&s_fav[s_fav_n], 0, sizeof(fav_t) * (size_t)(FAV_MAX - s_fav_n));
+
+    nvs_handle_t h;
+    if (nvs_open(FAV_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    if (nvs_set_blob(h, FAV_NVS_KEY, s_fav, sizeof s_fav) == ESP_OK) nvs_commit(h);
+    nvs_close(h);
+}
+
+static void fav_load(void)
+{
+    if (!fav_nvs_ready()) return;
+
+    nvs_handle_t h;
+    if (nvs_open(FAV_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+
+    fav_t tmp[FAV_MAX];
+    size_t len = sizeof tmp;
+    esp_err_t err = nvs_get_blob(h, FAV_NVS_KEY, tmp, &len);
+    nvs_close(h);
+    if (err != ESP_OK || len != sizeof tmp) return;
+
+    /* Sanitise on the way in: a blob from an older build, or a partially erased
+     * slot, must never put a garbage frequency on the list. */
+    int n = 0;
+    for (int i = 0; i < FAV_MAX; i++) {
+        if (tmp[i].hz >= FREQ_MIN && tmp[i].hz <= FREQ_MAX &&
+            tmp[i].mode < DSP_MODE_COUNT)
+            s_fav[n++] = tmp[i];
+    }
+    s_fav_n = n;
+}
+
+static void fav_add_current(void)
+{
+    /* Already stored (same channel, same demod)? Leave the list alone rather
+     * than growing a duplicate every time the button is pressed twice. */
+    for (int i = 0; i < s_fav_n; i++) {
+        if (s_fav[i].hz == s_center && s_fav[i].mode == (uint8_t)s_mode) return;
+    }
+
+    if (s_fav_n >= FAV_MAX) {
+        /* Full: drop the oldest. The list is a shortcut, not an archive, and a
+         * "list full" dialog would be a worse interruption than losing the entry
+         * the user has not touched for longest. */
+        memmove(&s_fav[0], &s_fav[1], sizeof(fav_t) * (FAV_MAX - 1));
+        s_fav_n = FAV_MAX - 1;
+    }
+    s_fav[s_fav_n].hz = s_center;
+    s_fav[s_fav_n].mode = (uint8_t)s_mode;
+    s_fav_n++;
+    fav_save();
+    s_redraw = true;
+    ESP_LOGI(TAG, "saved favorite %d: %.3f MHz mode %d", s_fav_n, s_center / 1e6, s_mode);
+}
+
+static void fav_remove(int idx)
+{
+    if (idx < 0 || idx >= s_fav_n) return;
+    memmove(&s_fav[idx], &s_fav[idx + 1], sizeof(fav_t) * (size_t)(s_fav_n - idx - 1));
+    s_fav_n--;
+    fav_save();
+    s_redraw = true;
+}
+
+static void fav_apply(int idx)
+{
+    if (idx < 0 || idx >= s_fav_n) return;
+    /* Mode first: ui_set_freq() flushes the FFT accumulator, so setting the mode
+     * afterwards would let one frame be mixed at the old setting. */
+    ui_set_mode(s_fav[idx].mode);
+    ui_set_freq(s_fav[idx].hz);
+}
+
+static void fav_close(void)
+{
+    s_fav_open = false;
+    s_fav_hot = FAV_HIT_NONE;
+    s_fav_closed = true; /* tell ui_task to rebuild what was underneath */
+}
+
+static void fav_dispatch(int hit)
+{
+    if (hit == FAV_HIT_CLOSE) { fav_close(); return; }
+    if (hit == FAV_HIT_SAVE)  { fav_add_current(); return; }
+    if (hit >= FAV_HIT_DEL(0) && hit < FAV_HIT_DEL(FAV_MAX)) {
+        fav_remove(hit - FAV_HIT_DEL(0));
+        return;
+    }
+    if (hit >= 0 && hit < FAV_MAX) { fav_apply(hit); fav_close(); }
+}
+
+static int fav_hit(int lx, int ly)
+{
+    if (ly >= FAV_ROW_Y0 && ly < FAV_ROW_Y0 + FAV_MAX * FAV_ROW_H) {
+        int row = (ly - FAV_ROW_Y0) / FAV_ROW_H;
+        if (row >= s_fav_n) return FAV_HIT_NONE; /* empty slot: nothing to hit */
+
+        int dx = KP_X0 + KP_W - KP_PAD - FAV_DEL_W;
+        if (lx >= dx && lx < dx + FAV_DEL_W) return FAV_HIT_DEL(row);
+        if (lx >= KP_X0 + KP_PAD && lx < KP_X0 + KP_W - KP_PAD) return row;
+        return FAV_HIT_NONE;
+    }
+
+    if (ly >= KP_Y0 && ly < KP_Y0 + 34) {
+        int cx = KP_X0 + KP_W - 30;
+        if (lx >= cx && lx < KP_X0 + KP_W - 4) return FAV_HIT_CLOSE;
+    }
+
+    if (ly >= KP_BTN_Y && ly < KP_BTN_Y + KP_BTN_H) {
+        int bx = KP_X0 + KP_PAD;
+        if (lx >= bx && lx < bx + KP_BTN_W) return FAV_HIT_SAVE;
+        /* Second button is CLOSE. It is drawn by draw_favorites() and must have
+         * a matching hit region: without this the visible button does nothing
+         * and only the small "X" in the title bar can dismiss the panel. */
+        int cx2 = bx + KP_BTN_W + KP_GAP;
+        if (lx >= cx2 && lx < cx2 + KP_BTN_W) return FAV_HIT_CLOSE;
+    }
+
+    return FAV_HIT_NONE;
+}
+
+static void fav_mode_style(int mode, const char **lab, uint16_t *col)
+{
+    /* Same colours as the header badge, so the list does not invent a second
+     * vocabulary for the same three modes. */
+    switch (mode) {
+    case DSP_MODE_AM:  *lab = "AM";  *col = COL_CYAN;   break;
+    case DSP_MODE_NFM: *lab = "NFM"; *col = COL_YELLOW; break;
+    default:           *lab = "WFM"; *col = COL_GREEN;  break;
+    }
+}
+
+/* Five-pointed star, filled. The bitmap font only covers ' '..'~', so the mark
+ * has to be drawn rather than typed. */
+static void draw_star(int cx, int cy, int r, uint16_t c)
+{
+    int px[10], py[10];
+    for (int i = 0; i < 10; i++) {
+        float a = -1.5707963f + (float)i * 3.14159265f / 5.0f;
+        int rr = (i & 1) ? r / 2 : r;
+        px[i] = cx + (int)lroundf(cosf(a) * (float)rr);
+        py[i] = cy + (int)lroundf(sinf(a) * (float)rr);
+    }
+    poly(px, py, 10, c);
+}
+
+static void draw_favorites(void)
+{
+    /* Clear the whole buffer, not just the panel: the waterfall scrolls in place
+     * inside this same buffer, so an overlay would be dragged down as history.
+     * The keypad learned this the hard way; see draw_keypad(). */
+    rect(0, 0, LW, LH, COL_BG);
+    rect(KP_X0, KP_Y0, KP_W, KP_H, COL_BG);
+    hline(KP_X0, KP_Y0, KP_W, COL_CYAN);
+    hline(KP_X0, KP_Y0 + KP_H - 1, KP_W, COL_CYAN);
+    vline(KP_X0, KP_Y0, KP_H, COL_CYAN);
+    vline(KP_X0 + KP_W - 1, KP_Y0, KP_H, COL_CYAN);
+
+    const int midx = KP_X0 + KP_W / 2;
+
+    /* --- title bar ------------------------------------------------------- */
+    draw_star(KP_X0 + KP_PAD + 5, KP_Y0 + 14, 7, COL_CURSOR);
+    text(KP_X0 + KP_PAD + 16, KP_Y0 + 8, 2, COL_WHITE, "FAVORITES");
+    text_r(KP_X0 + KP_W - 16, KP_Y0 + 12, 1,
+           (s_fav_hot == FAV_HIT_CLOSE) ? COL_RED : COL_DIM, "X");
+
+    if (s_fav_n == 0) {
+        text_c(midx, FAV_ROW_Y0 + 56, 1, COL_DIM, "NO FAVORITES YET");
+        text_c(midx, FAV_ROW_Y0 + 74, 1, COL_DIM, "hold the frequency to save");
+    }
+
+    /* --- rows ------------------------------------------------------------ */
+    for (int i = 0; i < FAV_MAX; i++) {
+        int y = FAV_ROW_Y0 + i * FAV_ROW_H;
+
+        if (i >= s_fav_n) {
+            /* Empty slot: a hairline only, so the eight-slot capacity stays
+             * visible without pretending there is content. */
+            hline(KP_X0 + KP_PAD, y + FAV_ROW_H / 2, KP_W - 2 * KP_PAD, COL_GRIDV);
+            continue;
+        }
+
+        bool cur = (s_fav[i].hz == s_center && s_fav[i].mode == (uint8_t)s_mode);
+        bool hot = (s_fav_hot == i);
+        uint16_t bg = hot ? COL_GREEN : (cur ? COL_CURSOR : RGB565(0, 26, 14));
+        uint16_t fg = (hot || cur) ? COL_BG : COL_GREEN;
+
+        rect(KP_X0 + KP_PAD, y, KP_W - 2 * KP_PAD, FAV_ROW_H - 3, bg);
+
+        char b[24];
+        snprintf(b, sizeof b, "%d", i + 1);
+        text(KP_X0 + KP_PAD + 6, y + 8, 1, fg, b);
+
+        snprintf(b, sizeof b, "%.3f MHz", s_fav[i].hz / 1e6);
+        text(KP_X0 + KP_PAD + 22, y + 8, 1, fg, b);
+
+        const char *lab;
+        uint16_t mc;
+        fav_mode_style(s_fav[i].mode, &lab, &mc);
+        text(KP_X0 + KP_PAD + 140, y + 8, 1, (hot || cur) ? COL_BG : mc, lab);
+
+        /* Per-row delete. Small on purpose: it sits beside the row's own tap
+         * target, so it must be hard to hit by accident. */
+        int dx = KP_X0 + KP_W - KP_PAD - FAV_DEL_W;
+        bool dh = (s_fav_hot == FAV_HIT_DEL(i));
+        rect(dx, y + 3, FAV_DEL_W, FAV_ROW_H - 9, dh ? COL_RED : RGB565(40, 12, 12));
+        text_c(dx + FAV_DEL_W / 2, y + 8, 1, dh ? COL_BG : COL_RED, "X");
+    }
+
+    /* --- buttons --------------------------------------------------------- */
+    int bx = KP_X0 + KP_PAD;
+    bool hs = (s_fav_hot == FAV_HIT_SAVE);
+    rect(bx, KP_BTN_Y, KP_BTN_W, KP_BTN_H, hs ? COL_GREEN : RGB565(10, 40, 20));
+    text_c(bx + KP_BTN_W / 2, KP_BTN_Y + KP_BTN_H / 2 - 7, 2,
+           hs ? COL_BG : COL_GREEN, "SAVE");
+
+    int cx2 = bx + KP_BTN_W + KP_GAP;
+    rect(cx2, KP_BTN_Y, KP_BTN_W, KP_BTN_H, RGB565(40, 12, 12));
+    text_c(cx2 + KP_BTN_W / 2, KP_BTN_Y + KP_BTN_H / 2 - 7, 2, COL_RED, "CLOSE");
+}
+
 /* ---- footer -------------------------------------------------------------- */
 
 static void draw_footer(void)
@@ -1083,7 +1402,15 @@ static void draw_footer(void)
     rect(0, FOOT_Y, LW, LH - FOOT_Y, COL_BG);
     hline(0, FOOT_Y, LW, COL_GRID);
     text(8, FOOT_Y + 5, 1, COL_DIM, "TAB5-SA  RTL2832U");
-    text_c(LW / 2, FOOT_Y + 5, 1, COL_DIM, "SPECTRUM / WATERFALL");
+
+    /* Favorites entry point. This slot used to read "SPECTRUM / WATERFALL",
+     * which was decoration; a way into the list is worth the space. The count is
+     * shown so the button also reports state instead of only being a door. */
+    draw_star(FAV_BTN_X0 + 7, FOOT_Y + 8, 5, s_fav_n ? COL_CURSOR : COL_DIM);
+    char fb[20];
+    snprintf(fb, sizeof fb, "FAV %d/%d", s_fav_n, FAV_MAX);
+    text(FAV_BTN_X0 + 17, FOOT_Y + 5, 1, s_fav_n ? COL_CURSOR : COL_DIM, fb);
+
     text_r(632, FOOT_Y + 5, 1, COL_DIM, "TUNE:TAP/DRAG  MODE:TAP");
 }
 
@@ -1336,6 +1663,23 @@ static bool handle_touch(void)
         return changed;
     }
 
+    /* The favorites panel is modal in exactly the same way, and for the same
+     * reason: while it is up, a touch belongs to it and nothing underneath may
+     * react. Acting on release lets a finger slid off the wrong row be
+     * abandoned, which matters most for the per-row delete. */
+    if (s_fav_open) {
+        if (!pressed) {
+            int done = s_fav_hot;
+            s_fav_hot = FAV_HIT_NONE;
+            if (done != FAV_HIT_NONE) { fav_dispatch(done); changed = true; }
+        } else {
+            int hit = fav_hit(lx, ly);
+            if (hit != s_fav_hot) { s_fav_hot = hit; changed = true; }
+        }
+        prev = pressed;
+        return changed;
+    }
+
     if (!pressed) {
         /* A press that ended without ever moving past TAP_SLOP is a tap: retune
          * so the touched point becomes the centre. `dragging` is only set by the
@@ -1363,6 +1707,19 @@ static bool handle_touch(void)
         }
         if (s_vol_hot)  { s_vol_hot  = false; changed = true; }
         if (s_scan_hot >= 0) { s_scan_hot = -1; changed = true; }
+        if (s_freq_hot) {
+            s_freq_hot = false;
+            /* Same tap/hold grammar as the mode badge: a tap opens the keypad,
+             * a hold stores the current channel. One long-press idiom for the
+             * whole panel instead of a second one to learn. */
+            if (s_freq_hold >= MODE_LONG_POLLS) {
+                fav_add_current();
+            } else {
+                kp_open();
+            }
+            s_freq_hold = 0;
+            changed = true;
+        }
     }
 
     if (edge && scan_hit(lx, ly) >= 0) {
@@ -1408,8 +1765,21 @@ static bool handle_touch(void)
         s_mode_hold++;
     } else if (edge && lx >= FREQ_BOX_X0 && lx < FREQ_BOX_X1 &&
                ly >= FREQ_BOX_Y0 && ly < FREQ_BOX_Y1) {
-        /* Tap the big 7-segment readout to type a frequency directly. */
-        kp_open();
+        /* The readout has two actions: tap to type a frequency, hold to save the
+         * current one. Deferred to release so the hold can be distinguished from
+         * the tap — acting on press would fire the keypad before we know which
+         * gesture this is. */
+        s_freq_hot = true;
+        s_freq_hold = 0;
+        dragging = false;
+        changed = true;
+    } else if (pressed && s_freq_hot) {
+        s_freq_hold++;
+    } else if (edge && lx >= FAV_BTN_X0 && lx < FAV_BTN_X1 && ly >= FAV_BTN_Y0) {
+        /* Footer favorites entry. Acts on press: it only opens a panel, so there
+         * is no value to fine-tune by sliding. */
+        s_fav_open = true;
+        s_fav_hot = FAV_HIT_NONE;
         dragging = false;
         changed = true;
     } else if (pressed && lx >= VOL_ZONE_X0 &&
@@ -1528,6 +1898,36 @@ static void ui_task(void *arg)
             continue;
         }
 
+        /* ---- modal favorites --------------------------------------------- */
+        /* Same rule as the keypad: while a panel is up nothing else may draw,
+         * because the waterfall scrolls in place inside this same buffer and a
+         * live frame would drag the overlay downwards as if it were history. */
+        if (s_fav_open) {
+            static bool fpainted;
+            bool ch = handle_touch(); /* may close it via CLOSE or a row tap */
+            if (s_fav_open) {
+                if (ch || !fpainted) { draw_favorites(); present(); fpainted = true; }
+            } else {
+                fpainted = false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(8));
+            continue;
+        }
+
+        /* Panel just closed: it had painted over the whole buffer, so rebuild
+         * the static furniture. The next spectrum frame refills the plot. */
+        if (s_fav_closed) {
+            s_fav_closed = false;
+            rect(0, 0, LW, LH, COL_BG);
+            rect(PLOT_X0, WF_Y0, PLOT_W, WF_H, COL_BG);
+            draw_graticule();
+            draw_ruler();
+            draw_header();
+            draw_volume();
+            draw_footer();
+            present();
+        }
+
         /* Panel just closed: it had painted over the whole buffer, so rebuild
          * the static furniture. The next spectrum frame refills the plot. */
         if (s_kp_closed) {
@@ -1632,6 +2032,7 @@ void ui_start(void)
     if (!LBUF) { ESP_LOGE(TAG, "no PSRAM for landscape buffer"); return; }
     ESP_ERROR_CHECK(ppa_register_client(&(ppa_client_config_t){ .oper_type = PPA_OPERATION_SRM }, &s_ppa));
     build_wlut();
+    fav_load(); /* NVS: restore the saved channels before the first frame */
 
     /* Created before the render task starts, so present() never runs unlocked. */
     s_present_lock = xSemaphoreCreateMutex();
