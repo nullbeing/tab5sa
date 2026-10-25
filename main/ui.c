@@ -252,19 +252,31 @@ static int  s_kp_len;
 static int  s_kp_hot = -1; /* key index under the finger, for feedback     */
 static bool s_kp_closed;   /* overlay just closed: repaint underneath      */
 
-/* Favorites: eight fixed slots, persisted in NVS.
+/* Favorites: eight fixed slots, persisted in NVS, kept sorted by frequency.
  *
  * Each entry stores the demod mode as well as the frequency, because the mode
  * is band-dependent in practice (WFM on 88-108 MHz, AM on the airband). A list
  * of bare frequencies would land on the right channel with the wrong demod and
- * sound like a dead receiver. */
+ * sound like a dead receiver.
+ *
+ * `seq` is a monotonic counter recording when the entry was added. It exists
+ * because sorting broke the old "drop the oldest" rule: that used to mean
+ * index 0, which was true while the list was append-ordered. Once entries are
+ * sorted by frequency, index 0 is simply the lowest frequency, so the rule has
+ * to consult the counter instead. It lands in the struct's padding, so the
+ * record stays 8 bytes and existing NVS blobs still load — their seq reads as 0,
+ * which is handled as "unknown age". */
 typedef struct {
     uint32_t hz;
     uint8_t  mode;
+    uint16_t seq;
 } fav_t;
 
 static fav_t s_fav[FAV_MAX];
 static int   s_fav_n;
+/* Next value handed to fav_t.seq. Only compared, never persisted on its own, so
+ * a reboot that restarts it at 1 is harmless: entries keep their relative ages. */
+static uint16_t s_fav_seq = 1;
 static bool  s_fav_open;
 static int   s_fav_hot = -1;  /* hit id under the finger, -1 = none      */
 static bool  s_fav_closed;    /* overlay just closed: rebuild underneath */
@@ -1205,6 +1217,8 @@ static void fav_save(void)
     nvs_close(h);
 }
 
+static void fav_sort(void);
+
 static void fav_load(void)
 {
     if (!fav_nvs_ready()) return;
@@ -1227,6 +1241,38 @@ static void fav_load(void)
             s_fav[n++] = tmp[i];
     }
     s_fav_n = n;
+
+    /* Blobs written before `seq` existed have it as zero (the field sat in the
+     * struct's padding). Stamp those in blob order so their relative age is
+     * preserved rather than all reading as equally old, and continue the counter
+     * above the highest value seen. */
+    uint16_t next = 1;
+    for (int i = 0; i < s_fav_n; i++) {
+        if (s_fav[i].seq == 0) s_fav[i].seq = next;
+        if (s_fav[i].seq >= next) next = s_fav[i].seq + 1;
+    }
+    s_fav_seq = next;
+
+    fav_sort();
+}
+
+/* Order the list by frequency, ascending.
+ *
+ * Insertion sort: at most eight entries, and it is stable, so two favourites on
+ * the same frequency keep the order they were added in. Called after every
+ * mutation and after loading, so the stored blob is always in display order and
+ * the tile index maps straight onto s_fav[]. */
+static void fav_sort(void)
+{
+    for (int i = 1; i < s_fav_n; i++) {
+        fav_t key = s_fav[i];
+        int j = i - 1;
+        while (j >= 0 && s_fav[j].hz > key.hz) {
+            s_fav[j + 1] = s_fav[j];
+            j--;
+        }
+        s_fav[j + 1] = key;
+    }
 }
 
 static void fav_add_current(void)
@@ -1238,18 +1284,28 @@ static void fav_add_current(void)
     }
 
     if (s_fav_n >= FAV_MAX) {
-        /* Full: drop the oldest. The list is a shortcut, not an archive, and a
-         * "list full" dialog would be a worse interruption than losing the entry
-         * the user has not touched for longest. */
-        memmove(&s_fav[0], &s_fav[1], sizeof(fav_t) * (FAV_MAX - 1));
-        s_fav_n = FAV_MAX - 1;
+        /* Full: drop the oldest. This used to be index 0, which was true while
+         * the list was append-ordered; now that it is sorted by frequency, index
+         * 0 is just the lowest frequency. Compare seq instead, or the rule would
+         * quietly evict whichever channel happens to be lowest. */
+        int oldest = 0;
+        for (int i = 1; i < s_fav_n; i++)
+            if (s_fav[i].seq < s_fav[oldest].seq) oldest = i;
+        memmove(&s_fav[oldest], &s_fav[oldest + 1],
+                sizeof(fav_t) * (size_t)(s_fav_n - oldest - 1));
+        s_fav_n--;
     }
+
     s_fav[s_fav_n].hz = s_center;
     s_fav[s_fav_n].mode = (uint8_t)s_mode;
+    s_fav[s_fav_n].seq = s_fav_seq++;
     s_fav_n++;
+
+    fav_sort();
     fav_save();
     s_redraw = true;
-    ESP_LOGI(TAG, "saved favorite %d: %.3f MHz mode %d", s_fav_n, s_center / 1e6, s_mode);
+    ESP_LOGI(TAG, "saved favorite %.3f MHz mode %d (%d/%d)",
+             s_center / 1e6, s_mode, s_fav_n, FAV_MAX);
 }
 
 static void fav_remove(int idx)
