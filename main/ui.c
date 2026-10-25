@@ -77,10 +77,16 @@ static const char *TAG = "ui";
 #define SCAN_BTN_Y0   15
 #define SCAN_BTN_Y1   49
 #define SCAN_BTN_H    (SCAN_BTN_Y1 - SCAN_BTN_Y0)
-#define SCAN_BTN_W    72
-#define SCAN_BTN_GAP  12
+/* Four buttons now: seek down, play/stop, seek up, favourites.
+ * 4*57 + 3*8 = 252, ending at x=580 — 4 px clear of the mode badge at 584.
+ * They were 72 wide when there were three; 57 is still 9.9 mm on the panel, far
+ * above the ~7 mm comfortable touch target, so the shrink is not a usability
+ * cost. Height is untouched, so they stay aligned with the badge. */
+#define SCAN_BTN_W    57
+#define SCAN_BTN_GAP  8
 #define SCAN_BTN_X0   328
-#define SCAN_BTN_N    3
+#define SCAN_BTN_N    4
+#define SCAN_BTN_FAV  3   /* index of the favourites button */
 
 /* Scan behaviour. Steps are small relative to the 1.15 MHz view so a signal is
  * not skipped between steps; the tick rate gives the tuner and the demodulator
@@ -167,12 +173,8 @@ static const char *TAG = "ui";
 #define FAV_GRID_Y0  (KP_Y0 + 40)          /* 54: just below the title band */
 #define FAV_DEL_R      3                   /* delete cross radius, px       */
 #define FAV_CLOSE_W   20                   /* title-bar close target        */
-/* Footer slot that used to say "SPECTRUM / WATERFALL". Kept as the entry point
- * because that text was decoration; the favourites list is worth the space. */
-#define FAV_BTN_X0   250
-#define FAV_BTN_X1   390
-#define FAV_BTN_Y0   FOOT_Y
-#define FAV_BTN_Y1   LH
+/* Footer slot geometry is gone: the favourites entry point now lives in the
+ * control row (see SCAN_BTN_FAV), so the footer is back to its original text. */
 
 /* ---- theme --------------------------------------------------------------- */
 #define RGB565(r, g, b) \
@@ -624,6 +626,10 @@ static void draw_battery(void)
  * dongle, so no IQ is read and the plot goes to the same static "no data"
  * state as an unplugged receiver. It is not a mute.
  */
+/* Defined further down with the favourites panel; the control row draws the
+ * same mark, so it needs a forward declaration here. */
+static void draw_bookmark(int cx, int cy, int sc, uint16_t c);
+
 static void scan_btn_x(int idx, int *x)
 {
     *x = SCAN_BTN_X0 + idx * (SCAN_BTN_W + SCAN_BTN_GAP);
@@ -643,9 +649,13 @@ static int scan_hit(int lx, int ly)
 
 static void draw_scan_buttons(void)
 {
-    /* Left-to-right: hunt down, play/stop decode, hunt up. The middle button
-     * does not move the receiver at all — it latches the demodulator mute, so
-     * the arrows are the only things that change frequency. */
+    /* Left to right: hunt down, play/stop, hunt up, favourites.
+     *
+     * The first three all act on the receiver, so they share one visual language
+     * (dim until active, amber while active). Favourites opens a panel instead of
+     * touching the receiver, so it is always amber — the same colour the
+     * bookmark mark uses everywhere else. Its icon is drawn at the same visual
+     * weight as the triangles: bookmark sc=2 is 16x14, the triangles are 12x16. */
     bool playing = sdr_get_running();
 
     for (int i = 0; i < SCAN_BTN_N; i++) {
@@ -653,6 +663,16 @@ static void draw_scan_buttons(void)
         scan_btn_x(i, &x);
 
         bool hot = (s_scan_hot == i);
+
+        if (i == SCAN_BTN_FAV) {
+            rect(x, SCAN_BTN_Y0, SCAN_BTN_W, SCAN_BTN_H,
+                 hot ? COL_CURSOR : RGB565(0, 18, 10));
+            draw_bookmark(x + SCAN_BTN_W / 2,
+                          (SCAN_BTN_Y0 + SCAN_BTN_Y1) / 2, 2,
+                          hot ? COL_BG : COL_CURSOR);
+            continue;
+        }
+
         /* Light whichever button owns the current state, so the panel says
          * what is happening without a separate indicator. */
         bool active = (i == 0) ? (s_scan_dir < 0)
@@ -671,8 +691,8 @@ static void draw_scan_buttons(void)
             int py[3] = { cy - 8, cy,      cy + 8 };
             poly(px, py, 3, fg);
         } else if (i == 1) {
-            /* Show the action the press will perform: a stop bar while audio is
-             * running, a play triangle while it is muted. */
+            /* Show the action the press will perform: a stop bar while the
+             * receiver runs, a play triangle while it is stopped. */
             if (playing) {
                 rect(cx - 7, cy - 7, 14, 14, fg); /* stop */
             } else {
@@ -1508,15 +1528,7 @@ static void draw_footer(void)
     rect(0, FOOT_Y, LW, LH - FOOT_Y, COL_BG);
     hline(0, FOOT_Y, LW, COL_GRID);
     text(8, FOOT_Y + 5, 1, COL_DIM, "TAB5-SA  RTL2832U");
-
-    /* Favorites entry point. This slot used to read "SPECTRUM / WATERFALL",
-     * which was decoration; a way into the list is worth the space. The count is
-     * shown so the button also reports state instead of only being a door. */
-    draw_bookmark(FAV_BTN_X0 + 6, FOOT_Y + 8, 1, s_fav_n ? COL_CURSOR : COL_DIM);
-    char fb[20];
-    snprintf(fb, sizeof fb, "FAV %d/%d", s_fav_n, FAV_MAX);
-    text(FAV_BTN_X0 + 17, FOOT_Y + 5, 1, s_fav_n ? COL_CURSOR : COL_DIM, fb);
-
+    text_c(LW / 2, FOOT_Y + 5, 1, COL_DIM, "SPECTRUM / WATERFALL");
     text_r(632, FOOT_Y + 5, 1, COL_DIM, "TUNE:TAP/DRAG  MODE:TAP");
 }
 
@@ -1833,7 +1845,17 @@ static bool handle_touch(void)
          * latched actions (start/stop), not a value the finger is dragging, so
          * there is nothing to fine-tune by sliding. */
         int b = scan_hit(lx, ly);
-        if (b == 1) {
+        if (b == SCAN_BTN_FAV) {
+            /* Opens a modal panel; it does not touch the receiver, so there is
+             * nothing to latch and nothing to stop. */
+            s_fav_open = true;
+            s_fav_hot = FAV_HIT_NONE;
+            s_scan_hot = b;
+            dragging = false;
+            changed = true;
+            prev = pressed;
+            return changed;
+        } else if (b == 1) {
             /* Play/stop is a real run/stop, not a mute: stopping releases the
              * dongle, so no IQ is read at all and the screen goes to the same
              * static "no data" state as an unplugged receiver. */
@@ -1881,13 +1903,6 @@ static bool handle_touch(void)
         changed = true;
     } else if (pressed && s_freq_hot) {
         s_freq_hold++;
-    } else if (edge && lx >= FAV_BTN_X0 && lx < FAV_BTN_X1 && ly >= FAV_BTN_Y0) {
-        /* Footer favorites entry. Acts on press: it only opens a panel, so there
-         * is no value to fine-tune by sliding. */
-        s_fav_open = true;
-        s_fav_hot = FAV_HIT_NONE;
-        dragging = false;
-        changed = true;
     } else if (pressed && lx >= VOL_ZONE_X0 &&
                ly >= VOL_BAR_TOP - 16 && ly <= VOL_BAR_BOT + 2) {
         /* Volume gutter. Tested BEFORE the waterfall branch: the gutter lies
