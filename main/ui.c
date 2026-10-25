@@ -607,11 +607,17 @@ static void draw_battery(void)
     snprintf(b, sizeof b, "%d%%", pct);
     text(x + 30, y + 3, 1, col, b);
 
-    /* 2S pack, so ~6.4 V empty .. 8.4 V full */
-    snprintf(b, sizeof b, "%.1fV", s_bat.mv / 1000.0f);
+    /* Two decimals, not one. The charge curve's top segment runs 8200 mV = 92%
+     * to 8400 mV = 100%, so 1% is only 25 mV there. Printing "%.1fV" quantises
+     * to 100 mV — four times coarser than the percentage it sits beside — so the
+     * voltage sat frozen at "8.3V" through the whole constant-voltage phase even
+     * though the pack was creeping upward. At 10 mV per step the drift is
+     * visible, which is the difference between "the meter is stuck" and "the
+     * battery is nearly full and moving slowly". */
+    snprintf(b, sizeof b, "%.2fV", s_bat.mv / 1000.0f);
     text(x + 56, y + 3, 1, COL_DIM, b);
 
-    if (s_bat.charging) text(x + 88, y + 3, 1, COL_CYAN, "CHG");
+    if (s_bat.charging) text(x + 92, y + 3, 1, COL_CYAN, "CHG");
 }
 
 /* ---- header -------------------------------------------------------------- */
