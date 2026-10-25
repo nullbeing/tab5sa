@@ -172,7 +172,6 @@ static const char *TAG = "ui";
 #define FAV_TILE_GY    6
 #define FAV_GRID_Y0  (KP_Y0 + 40)          /* 54: just below the title band */
 #define FAV_DEL_R      3                   /* delete cross radius, px       */
-#define FAV_CLOSE_W   20                   /* title-bar close target        */
 /* Footer slot geometry is gone: the favourites entry point now lives in the
  * control row (see SCAN_BTN_FAV), so the footer is back to its original text. */
 
@@ -269,11 +268,12 @@ static int   s_fav_n;
 static bool  s_fav_open;
 static int   s_fav_hot = -1;  /* hit id under the finger, -1 = none      */
 static bool  s_fav_closed;    /* overlay just closed: rebuild underneath */
-/* Polls the frequency readout has been held. A short tap opens the keypad, a
- * long one stores the current channel — same tap/hold grammar as the mode
- * badge, so there is only one long-press idiom to learn. */
-static int   s_freq_hold;
-static bool  s_freq_hot;      /* finger is on the frequency readout        */
+/* Polls the favourites button has been held. Short tap opens the list, long
+ * press stores the current channel. The add action lives out here, on the main
+ * screen, because that is where the frequency being saved is actually visible —
+ * inside the panel it is hidden behind the overlay and "SAVE" has to be taken
+ * on faith. */
+static int   s_fav_hold;
 
 static const char *const KP_LABELS[12] = {
     "1", "2", "3",
@@ -1171,8 +1171,8 @@ static void draw_keypad(void)
 #define FAV_NVS_KEY  "favs"
 
 #define FAV_HIT_NONE  (-1)
+#define FAV_HIT_NONE  (-1)
 #define FAV_HIT_CLOSE  30
-#define FAV_HIT_SAVE   31
 #define FAV_HIT_DEL(i) (20 + (i))
 
 static bool fav_nvs_ready(void)
@@ -1280,7 +1280,6 @@ static void fav_close(void)
 static void fav_dispatch(int hit)
 {
     if (hit == FAV_HIT_CLOSE) { fav_close(); return; }
-    if (hit == FAV_HIT_SAVE)  { fav_add_current(); return; }
     if (hit >= FAV_HIT_DEL(0) && hit < FAV_HIT_DEL(FAV_MAX)) {
         fav_remove(hit - FAV_HIT_DEL(0));
         return;
@@ -1311,25 +1310,13 @@ static int fav_hit(int lx, int ly)
         return i;
     }
 
-    /* Title-band close cross. The target is a square around the glyph, so it
-     * stays easy to hit on glass while looking like a 9 px mark. */
-    if (ly >= KP_Y0 && ly < KP_Y0 + 33) {
-        int cx = KP_X0 + KP_W - FAV_CLOSE_W / 2 - 6;
-        int cy = KP_Y0 + 16;
-        if (lx >= cx - FAV_CLOSE_W / 2 && lx < cx + FAV_CLOSE_W / 2 &&
-            ly >= cy - FAV_CLOSE_W / 2 && ly < cy + FAV_CLOSE_W / 2)
-            return FAV_HIT_CLOSE;
-    }
-
-    if (ly >= KP_BTN_Y && ly < KP_BTN_Y + KP_BTN_H) {
-        int bx = KP_X0 + KP_PAD;
-        if (lx >= bx && lx < bx + KP_BTN_W) return FAV_HIT_SAVE;
-        /* Second button is CLOSE. It is drawn by draw_favorites() and must have
-         * a matching hit region: without this the visible button does nothing
-         * and only the small cross in the title band can dismiss the panel. */
-        int cx2 = bx + KP_BTN_W + KP_GAP;
-        if (lx >= cx2 && lx < cx2 + KP_BTN_W) return FAV_HIT_CLOSE;
-    }
+    /* One full-width CLOSE. There used to be a small cross in the title band as
+     * well, which duplicated this and — worse — looked identical to the delete
+     * cross inside each tile. Two different meanings behind one glyph is how
+     * people delete a favourite they meant to keep. */
+    if (ly >= KP_BTN_Y && ly < KP_BTN_Y + KP_BTN_H &&
+        lx >= KP_X0 + KP_PAD && lx < KP_X0 + KP_W - KP_PAD)
+        return FAV_HIT_CLOSE;
 
     return FAV_HIT_NONE;
 }
@@ -1425,24 +1412,20 @@ static void draw_favorites(void)
     draw_bookmark(px0 + KP_PAD + 8, py0 + 18, 2, COL_CURSOR);
     text(px0 + KP_PAD + 19, py0 + 12, 2, COL_WHITE, "FAVORITES");
 
-    /* Close control: a drawn cross in a small square target. The font's 'X' at
-     * 5x7 reads as a letter, and a bare glyph has no press feedback. */
-    {
-        bool hc = (s_fav_hot == FAV_HIT_CLOSE);
-        int cx = px0 + pw - FAV_CLOSE_W / 2 - 6;
-        int cy = py0 + tband_h / 2 + 1;
-        if (hc)
-            rect(cx - FAV_CLOSE_W / 2, cy - FAV_CLOSE_W / 2, FAV_CLOSE_W, FAV_CLOSE_W,
-                 RGB565(60, 16, 16));
-        draw_x(cx, cy, 4, hc ? COL_RED : COL_DIM);
-    }
+    /* No close cross in the title band. It duplicated the CLOSE button and looked
+     * identical to the delete cross inside each tile — one glyph, two meanings,
+     * which is how a favourite gets deleted by someone meaning to shut the panel. */
 
     /* --- empty state ----------------------------------------------------- */
+    /* Centred in the tile area, not the whole panel: the panel now ends in a
+     * full-width CLOSE button, and the old formula pushed the second line down
+     * into it, where it was painted over. */
     if (s_fav_n == 0) {
-        int cy = FAV_GRID_Y0 + (FAV_MAX / 2) * (FAV_TILE_H + FAV_TILE_GY) - 26;
+        const int grid_h = FAV_MAX / 2 * (FAV_TILE_H + FAV_TILE_GY) - FAV_TILE_GY;
+        int cy = FAV_GRID_Y0 + grid_h / 2 - 20;
         draw_bookmark(midx, cy, 2, RGB565(46, 40, 16));
-        text_c(midx, cy + 26, 1, COL_DIM, "NO FAVORITES YET");
-        text_c(midx, cy + 42, 1, RGB565(60, 72, 60), "hold the frequency to save");
+        text_c(midx, cy + 24, 1, COL_DIM, "NO FAVORITES YET");
+        text_c(midx, cy + 40, 1, RGB565(60, 72, 60), "hold the bookmark to save");
     }
 
     /* --- tiles: 2 columns x 4 rows --------------------------------------- */
@@ -1451,13 +1434,14 @@ static void draw_favorites(void)
      * two per row, so the frequency gets scale 2 — the readability fix — while
      * all eight slots stay visible and no paging is needed. */
     const int ix = px0 + KP_PAD;
-    for (int i = 0; i < FAV_MAX; i++) {
+    for (int i = 0; s_fav_n > 0 && i < FAV_MAX; i++) {
         int x = ix + (i % 2) * (FAV_TILE_W + FAV_TILE_GX);
         int y = FAV_GRID_Y0 + (i / 2) * (FAV_TILE_H + FAV_TILE_GY);
 
         if (i >= s_fav_n) {
             /* Empty slot: outline only, so the eight-slot capacity stays visible
-             * without pretending there is content. */
+             * without pretending there is content. Skipped entirely when the list
+             * is empty, because the empty-state text sits in this same area. */
             rect(x, y, FAV_TILE_W, 1, RGB565(0, 34, 18));
             rect(x, y + FAV_TILE_H - 1, FAV_TILE_W, 1, RGB565(0, 34, 18));
             rect(x, y, 1, FAV_TILE_H, RGB565(0, 34, 18));
@@ -1499,26 +1483,23 @@ static void draw_favorites(void)
         draw_x(dx, dy, FAV_DEL_R, dh ? COL_RED : RGB565(96, 44, 44));
     }
 
-    /* --- buttons --------------------------------------------------------- */
+    /* --- close ----------------------------------------------------------- */
+    /* One full-width button. SAVE used to sit beside it, but it acted on the
+     * tuned frequency, which this panel covers completely — asking the user to
+     * trust a label about something they cannot see. Storing a channel now
+     * happens on the main screen (long-press the bookmark button), so this panel
+     * does exactly what its contents suggest: jump, delete, close. */
     int bx = px0 + KP_PAD;
     int by = KP_BTN_Y;
+    int bw = pw - 2 * KP_PAD;
 
-    bool hs = (s_fav_hot == FAV_HIT_SAVE);
-    rect(bx, by, KP_BTN_W, KP_BTN_H, hs ? COL_GREEN : RGB565(10, 40, 20));
-    hline(bx, by, KP_BTN_W, hs ? COL_GREEN : COL_GREEN);
-    text_c(bx + KP_BTN_W / 2, by + KP_BTN_H / 2 - 7, 2,
-           hs ? COL_BG : COL_GREEN, "SAVE");
-
-    /* Secondary action: outlined, not a solid red slab. Red fill is reserved
-     * for destructive confirmation, and closing a list destroys nothing. */
-    int cx2 = bx + KP_BTN_W + KP_GAP;
     bool hcl = (s_fav_hot == FAV_HIT_CLOSE);
-    rect(cx2, by, KP_BTN_W, KP_BTN_H, hcl ? RGB565(70, 14, 14) : RGB565(18, 8, 8));
-    hline(cx2, by, KP_BTN_W, COL_RED);
-    hline(cx2, by + KP_BTN_H - 1, KP_BTN_W, COL_RED);
-    vline(cx2, by, KP_BTN_H, COL_RED);
-    vline(cx2 + KP_BTN_W - 1, by, KP_BTN_H, COL_RED);
-    text_c(cx2 + KP_BTN_W / 2, by + KP_BTN_H / 2 - 7, 2, COL_RED, "CLOSE");
+    rect(bx, by, bw, KP_BTN_H, hcl ? RGB565(70, 14, 14) : RGB565(18, 8, 8));
+    hline(bx, by, bw, COL_RED);
+    hline(bx, by + KP_BTN_H - 1, bw, COL_RED);
+    vline(bx, by, KP_BTN_H, COL_RED);
+    vline(bx + bw - 1, by, KP_BTN_H, COL_RED);
+    text_c(bx + bw / 2, by + KP_BTN_H / 2 - 7, 2, COL_RED, "CLOSE");
 }
 
 /* ---- footer -------------------------------------------------------------- */
@@ -1824,18 +1805,21 @@ static bool handle_touch(void)
             changed = true;
         }
         if (s_vol_hot)  { s_vol_hot  = false; changed = true; }
-        if (s_scan_hot >= 0) { s_scan_hot = -1; changed = true; }
-        if (s_freq_hot) {
-            s_freq_hot = false;
-            /* Same tap/hold grammar as the mode badge: a tap opens the keypad,
-             * a hold stores the current channel. One long-press idiom for the
-             * whole panel instead of a second one to learn. */
-            if (s_freq_hold >= MODE_LONG_POLLS) {
+        /* Favourites button: released. Decide tap vs hold here so a finger slid
+         * off the button can be abandoned. */
+        if (s_scan_hot == SCAN_BTN_FAV) {
+            bool save = (s_fav_hold >= MODE_LONG_POLLS);
+            s_scan_hot = -1;
+            s_fav_hold = 0;
+            if (save) {
                 fav_add_current();
             } else {
-                kp_open();
+                s_fav_open = true;
+                s_fav_hot = FAV_HIT_NONE;
             }
-            s_freq_hold = 0;
+            changed = true;
+        } else if (s_scan_hot >= 0) {
+            s_scan_hot = -1;
             changed = true;
         }
     }
@@ -1846,11 +1830,11 @@ static bool handle_touch(void)
          * there is nothing to fine-tune by sliding. */
         int b = scan_hit(lx, ly);
         if (b == SCAN_BTN_FAV) {
-            /* Opens a modal panel; it does not touch the receiver, so there is
-             * nothing to latch and nothing to stop. */
-            s_fav_open = true;
-            s_fav_hot = FAV_HIT_NONE;
+            /* Deferred to release: a hold means "store this channel", a tap means
+             * "open the list". Acting on press would open the panel before the
+             * gesture could be told apart. */
             s_scan_hot = b;
+            s_fav_hold = 0;
             dragging = false;
             changed = true;
             prev = pressed;
@@ -1881,6 +1865,8 @@ static bool handle_touch(void)
         s_scan_hot = b;
         dragging = false;
         changed = true;
+    } else if (pressed && s_scan_hot == SCAN_BTN_FAV) {
+        s_fav_hold++;
     } else if (edge && lx >= MODE_BOX_X0 && lx < MODE_BOX_X1 &&
         ly >= MODE_BOX_Y0 && ly < MODE_BOX_Y1) {
         /* Mode badge: act on RELEASE, so a hold can mean something different
@@ -1893,16 +1879,10 @@ static bool handle_touch(void)
         s_mode_hold++;
     } else if (edge && lx >= FREQ_BOX_X0 && lx < FREQ_BOX_X1 &&
                ly >= FREQ_BOX_Y0 && ly < FREQ_BOX_Y1) {
-        /* The readout has two actions: tap to type a frequency, hold to save the
-         * current one. Deferred to release so the hold can be distinguished from
-         * the tap — acting on press would fire the keypad before we know which
-         * gesture this is. */
-        s_freq_hot = true;
-        s_freq_hold = 0;
+        /* Tap the big 7-segment readout to type a frequency directly. */
+        kp_open();
         dragging = false;
         changed = true;
-    } else if (pressed && s_freq_hot) {
-        s_freq_hold++;
     } else if (pressed && lx >= VOL_ZONE_X0 &&
                ly >= VOL_BAR_TOP - 16 && ly <= VOL_BAR_BOT + 2) {
         /* Volume gutter. Tested BEFORE the waterfall branch: the gutter lies
