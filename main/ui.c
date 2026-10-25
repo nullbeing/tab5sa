@@ -1327,24 +1327,25 @@ static void fav_mode_style(int mode, const char **lab, uint16_t *col)
  * the resolution — and a bookmark has a V cut out of its bottom edge, so it
  * needs the same treatment.
  *
- * 7x9, bit 6 = leftmost column. Rounded top corners, straight sides, notch
- * opening upward from the bottom edge. `sc` scales in whole pixels so the
- * footer (1x) and the empty-state mark (2x) both stay sharp. */
-#define BM_W 7
-#define BM_H 9
+ * 8x7, bit 7 = leftmost column. Square corners and wider than it is tall: the
+ * earlier 7x9 rounded-top version read as a shield at this size. The notch
+ * widens downward (2, 4, 6 px) so the two legs come to points, which is what
+ * makes it read as a bookmark rather than a tag with a bite out of it.
+ * `sc` scales in whole pixels so the footer (1x) and the empty state (2x) both
+ * stay sharp. */
+#define BM_W 8
+#define BM_H 7
 
 static void draw_bookmark(int cx, int cy, int sc, uint16_t c)
 {
     static const uint8_t ROW[BM_H] = {
-        0x3E, /* .#####. */
-        0x7F, /* ####### */
-        0x7F, /* ####### */
-        0x7F, /* ####### */
-        0x7F, /* ####### */
-        0x7F, /* ####### */
-        0x7F, /* ####### */
-        0x63, /* ##...## */
-        0x41, /* #.....# */
+        0xFF, /* ######## */
+        0xFF, /* ######## */
+        0xFF, /* ######## */
+        0xFF, /* ######## */
+        0xE7, /* ###..### */
+        0xC3, /* ##....## */
+        0x81, /* #......# */
     };
     int x0 = cx - (BM_W / 2) * sc;
     int y0 = cy - (BM_H / 2) * sc;
@@ -1389,9 +1390,12 @@ static void draw_favorites(void)
     hline(px0 + 1, py0 + tband_h + 1, pw - 2, COL_GRID);
 
     /* Mark matches the title's own scale (2), not a smaller size: the band is
-     * 32 px tall, so there is room, and a 9 px icon beside 14 px capitals reads
-     * as an accident. Vertical centre is the text's centre (py0+12 + 14/2). */
-    draw_bookmark(px0 + KP_PAD + 7, py0 + 19, 2, COL_CURSOR);
+     * 32 px tall, so there is room, and a small icon beside 14 px capitals reads
+     * as an accident. With BM_W=8 at sc=2 the glyph is 16 px wide, so centring
+     * it on px0+KP_PAD+8 puts its left edge exactly on the panel padding; the
+     * text then starts 3 px later. Vertically the bitmap is top-aligned with the
+     * text (both 14 px tall from py0+12). */
+    draw_bookmark(px0 + KP_PAD + 8, py0 + 18, 2, COL_CURSOR);
     text(px0 + KP_PAD + 19, py0 + 12, 2, COL_WHITE, "FAVORITES");
 
     /* Close control: a drawn cross in a small square target. The font's 'X' at
