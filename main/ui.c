@@ -1318,26 +1318,39 @@ static void fav_mode_style(int mode, const char **lab, uint16_t *col)
     }
 }
 
-/* Five-pointed star, from a bitmap.
+/* Bookmark mark, from a bitmap.
  *
- * It used to be a 10-vertex polygon filled by scanline. At the sizes this
- * appears (9 px) that fails visibly: the two bottom legs round into a single
- * trapezoid and the notch between them disappears, because a 10 px tall shape
- * cannot resolve ten vertices. A hand-placed bitmap is crisp at every size and
- * costs less than the trigonometry did.
+ * It replaced a five-pointed star, and the reason both are bitmaps is the same:
+ * poly() fills each scanline as one continuous span (it takes the min/max of
+ * every edge crossing), so a concave shape loses its notch. The star's legs
+ * merged into a trapezoid at *every* size — the fill rule was the problem, not
+ * the resolution — and a bookmark has a V cut out of its bottom edge, so it
+ * needs the same treatment.
  *
- * `sc` scales it in whole pixels; 1 is the normal size. */
-static void draw_star(int cx, int cy, int sc, uint16_t c)
+ * 7x9, bit 6 = leftmost column. Rounded top corners, straight sides, notch
+ * opening upward from the bottom edge. `sc` scales in whole pixels so the
+ * footer (1x) and the empty-state mark (2x) both stay sharp. */
+#define BM_W 7
+#define BM_H 9
+
+static void draw_bookmark(int cx, int cy, int sc, uint16_t c)
 {
-    /* 9x9, bit 8 = leftmost column. Row 3 is the pair of side points; rows 6-8
-     * open the notch between the two legs. */
-    static const uint16_t ROW[9] = {
-        0x010, 0x038, 0x038, 0x1FF, 0x0FE, 0x07C, 0x06C, 0x0C6, 0x183,
+    static const uint8_t ROW[BM_H] = {
+        0x3E, /* .#####. */
+        0x7F, /* ####### */
+        0x7F, /* ####### */
+        0x7F, /* ####### */
+        0x7F, /* ####### */
+        0x7F, /* ####### */
+        0x7F, /* ####### */
+        0x63, /* ##...## */
+        0x41, /* #.....# */
     };
-    int x0 = cx - 4 * sc, y0 = cy - 4 * sc;
-    for (int r = 0; r < 9; r++)
-        for (int b = 0; b < 9; b++)
-            if (ROW[r] & (1u << (8 - b)))
+    int x0 = cx - (BM_W / 2) * sc;
+    int y0 = cy - (BM_H / 2) * sc;
+    for (int r = 0; r < BM_H; r++)
+        for (int b = 0; b < BM_W; b++)
+            if (ROW[r] & (1u << (BM_W - 1 - b)))
                 rect(x0 + b * sc, y0 + r * sc, sc, sc, c);
 }
 
@@ -1375,8 +1388,11 @@ static void draw_favorites(void)
     rect(px0 + 1, py0 + 1, pw - 2, tband_h, RGB565(0, 18, 10));
     hline(px0 + 1, py0 + tband_h + 1, pw - 2, COL_GRID);
 
-    draw_star(px0 + KP_PAD + 6, py0 + 16, 1, COL_CURSOR);
-    text(px0 + KP_PAD + 16, py0 + 12, 2, COL_WHITE, "FAVORITES");
+    /* Mark matches the title's own scale (2), not a smaller size: the band is
+     * 32 px tall, so there is room, and a 9 px icon beside 14 px capitals reads
+     * as an accident. Vertical centre is the text's centre (py0+12 + 14/2). */
+    draw_bookmark(px0 + KP_PAD + 7, py0 + 19, 2, COL_CURSOR);
+    text(px0 + KP_PAD + 19, py0 + 12, 2, COL_WHITE, "FAVORITES");
 
     /* Close control: a drawn cross in a small square target. The font's 'X' at
      * 5x7 reads as a letter, and a bare glyph has no press feedback. */
@@ -1393,7 +1409,7 @@ static void draw_favorites(void)
     /* --- empty state ----------------------------------------------------- */
     if (s_fav_n == 0) {
         int cy = FAV_ROW_Y0 + FAV_MAX * FAV_ROW_H / 2 - 26;
-        draw_star(midx, cy, 2, RGB565(46, 40, 16));
+        draw_bookmark(midx, cy, 2, RGB565(46, 40, 16));
         text_c(midx, cy + 26, 1, COL_DIM, "NO FAVORITES YET");
         text_c(midx, cy + 42, 1, RGB565(60, 72, 60), "hold the frequency to save");
     }
@@ -1478,7 +1494,7 @@ static void draw_footer(void)
     /* Favorites entry point. This slot used to read "SPECTRUM / WATERFALL",
      * which was decoration; a way into the list is worth the space. The count is
      * shown so the button also reports state instead of only being a door. */
-    draw_star(FAV_BTN_X0 + 7, FOOT_Y + 8, 1, s_fav_n ? COL_CURSOR : COL_DIM);
+    draw_bookmark(FAV_BTN_X0 + 6, FOOT_Y + 8, 1, s_fav_n ? COL_CURSOR : COL_DIM);
     char fb[20];
     snprintf(fb, sizeof fb, "FAV %d/%d", s_fav_n, FAV_MAX);
     text(FAV_BTN_X0 + 17, FOOT_Y + 5, 1, s_fav_n ? COL_CURSOR : COL_DIM, fb);

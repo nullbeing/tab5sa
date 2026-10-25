@@ -134,6 +134,11 @@ def grab(fd, deadline_s=45):
             break
 
     rest = read_until(fd, HDR_LEN - 4, deadline)
+    if len(rest) != HDR_LEN - 4:
+        # Should be impossible after read_until(), but a short read here would
+        # otherwise surface as a bare struct.error and abort the whole retry
+        # loop instead of being treated as one bad attempt.
+        raise ValueError("short header (%d/%d bytes)" % (len(rest), HDR_LEN - 4))
     w, h, nbytes, checksum = struct.unpack("<HHII", rest)
 
     if w * h * 2 != nbytes:

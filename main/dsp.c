@@ -229,7 +229,18 @@ static void iq_proc_task(void *arg)
 
 void dsp_start(void)
 {
-    dsps_fft2r_init_fc32(NULL, FFT_N);
+    /* The return value matters. dsps_fft2r_init_fc32() mallocs the twiddle and
+     * bit-reversal tables and returns an error if either allocation fails, but
+     * leaves the table pointer NULL. The FFT asm then loads through that NULL
+     * pointer, which on this core is a Load access fault deep inside
+     * dsps_fft2r_fc32_arp4.S with no hint of the real cause. Refuse to start the
+     * DSP task instead: no spectrum is far better than a boot loop. */
+    esp_err_t err = dsps_fft2r_init_fc32(NULL, FFT_N);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "FFT table init failed (%s); spectrum disabled",
+                 esp_err_to_name(err));
+        return;
+    }
     dsps_wind_hann_f32(s_window, FFT_N);
     memset(s_acc, 0, sizeof(s_acc));
     ESP_LOGI(TAG, "FM demod + FFT %d starting", FFT_N);
