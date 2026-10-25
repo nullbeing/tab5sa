@@ -160,11 +160,13 @@ static const char *TAG = "ui";
 /* Same window as the keypad, on purpose: two modal panels that land in
  * different places would read as two unrelated features. */
 #define FAV_MAX      8
-#define FAV_ROW_Y0   (KP_Y0 + 50)          /* below the title band     */
-#define FAV_ROW_H    27
-#define FAV_LIST_H   (FAV_MAX * FAV_ROW_H)
-#define FAV_DEL_W    20                    /* per-row delete target    */
-#define FAV_CLOSE_W  20                    /* title-bar close target   */
+#define FAV_TILE_W   160                   /* 2 columns x 4 rows fit exactly */
+#define FAV_TILE_H    52
+#define FAV_TILE_GX    8
+#define FAV_TILE_GY    6
+#define FAV_GRID_Y0  (KP_Y0 + 40)          /* 54: just below the title band */
+#define FAV_DEL_R      3                   /* delete cross radius, px       */
+#define FAV_CLOSE_W   20                   /* title-bar close target        */
 /* Footer slot that used to say "SPECTRUM / WATERFALL". Kept as the entry point
  * because that text was decoration; the favourites list is worth the space. */
 #define FAV_BTN_X0   250
@@ -1268,20 +1270,25 @@ static void fav_dispatch(int hit)
 
 static int fav_hit(int lx, int ly)
 {
-    const int rx = KP_X0 + KP_PAD;
-    const int rw = KP_W - 2 * KP_PAD;
+    const int ix = KP_X0 + KP_PAD;
 
-    if (ly >= FAV_ROW_Y0 && ly < FAV_ROW_Y0 + FAV_MAX * FAV_ROW_H) {
-        int row = (ly - FAV_ROW_Y0) / FAV_ROW_H;
-        if (row >= s_fav_n) return FAV_HIT_NONE; /* empty slot: nothing to hit */
+    /* Tiles: 2 columns x 4 rows. Checked before anything else because they
+     * occupy most of the panel. */
+    for (int i = 0; i < FAV_MAX; i++) {
+        int x = ix + (i % 2) * (FAV_TILE_W + FAV_TILE_GX);
+        int y = FAV_GRID_Y0 + (i / 2) * (FAV_TILE_H + FAV_TILE_GY);
+        if (lx < x || lx >= x + FAV_TILE_W || ly < y || ly >= y + FAV_TILE_H)
+            continue;
 
-        /* Delete target centred on the drawn cross, not the whole row end:
-         * a wide invisible target here would swallow taps meant for the row. */
-        int dx = rx + rw - FAV_DEL_W / 2 - 2;
-        if (lx >= dx - FAV_DEL_W / 2 && lx < dx + FAV_DEL_W / 2)
-            return FAV_HIT_DEL(row);
-        if (lx >= rx && lx < rx + rw) return row;
-        return FAV_HIT_NONE;
+        if (i >= s_fav_n) return FAV_HIT_NONE; /* empty slot: nothing to hit */
+
+        /* Delete cross sits in the tile's bottom-right corner. Its target is a
+         * square around the glyph and stays inside the tile, so it can never
+         * steal a tap meant for the neighbouring tile. */
+        int dx = x + FAV_TILE_W - 12, dy = y + FAV_TILE_H - 13;
+        if (lx >= dx - 8 && lx < dx + 8 && ly >= dy - 8 && ly < dy + 8)
+            return FAV_HIT_DEL(i);
+        return i;
     }
 
     /* Title-band close cross. The target is a square around the glyph, so it
@@ -1412,57 +1419,64 @@ static void draw_favorites(void)
 
     /* --- empty state ----------------------------------------------------- */
     if (s_fav_n == 0) {
-        int cy = FAV_ROW_Y0 + FAV_MAX * FAV_ROW_H / 2 - 26;
+        int cy = FAV_GRID_Y0 + (FAV_MAX / 2) * (FAV_TILE_H + FAV_TILE_GY) - 26;
         draw_bookmark(midx, cy, 2, RGB565(46, 40, 16));
         text_c(midx, cy + 26, 1, COL_DIM, "NO FAVORITES YET");
         text_c(midx, cy + 42, 1, RGB565(60, 72, 60), "hold the frequency to save");
     }
 
-    /* --- rows ------------------------------------------------------------ */
+    /* --- tiles: 2 columns x 4 rows --------------------------------------- */
+    /* The list used to be one row per favourite, which forced the frequency to
+     * scale 1 (5 px glyphs, 10 px on the panel) to fit eight of them. Tiles put
+     * two per row, so the frequency gets scale 2 — the readability fix — while
+     * all eight slots stay visible and no paging is needed. */
+    const int ix = px0 + KP_PAD;
     for (int i = 0; i < FAV_MAX; i++) {
-        int y = FAV_ROW_Y0 + i * FAV_ROW_H;
-        int rx = px0 + KP_PAD;
-        int rw = pw - 2 * KP_PAD;
+        int x = ix + (i % 2) * (FAV_TILE_W + FAV_TILE_GX);
+        int y = FAV_GRID_Y0 + (i / 2) * (FAV_TILE_H + FAV_TILE_GY);
 
         if (i >= s_fav_n) {
-            /* Empty slot: a hairline keeps the eight-slot capacity visible
+            /* Empty slot: outline only, so the eight-slot capacity stays visible
              * without pretending there is content. */
-            hline(rx, y + FAV_ROW_H / 2, rw, COL_GRIDV);
+            rect(x, y, FAV_TILE_W, 1, RGB565(0, 34, 18));
+            rect(x, y + FAV_TILE_H - 1, FAV_TILE_W, 1, RGB565(0, 34, 18));
+            rect(x, y, 1, FAV_TILE_H, RGB565(0, 34, 18));
+            rect(x + FAV_TILE_W - 1, y, 1, FAV_TILE_H, RGB565(0, 34, 18));
+            text_c(x + FAV_TILE_W / 2, y + FAV_TILE_H / 2 - 3, 1,
+                   RGB565(0, 44, 0), "EMPTY");
             continue;
         }
 
         bool cur = (s_fav[i].hz == s_center && s_fav[i].mode == (uint8_t)s_mode);
         bool hot = (s_fav_hot == i);
 
-        /* Fill only on press. A permanently filled row for "current" made the
-         * list look like eight buttons with one stuck on; a 2 px accent bar
-         * says the same thing and leaves the text at full contrast. */
-        uint16_t bg = hot ? COL_GREEN : RGB565(0, 20, 12);
-        uint16_t fg_idx = hot ? COL_BG : COL_DIM;
-        uint16_t fg_frq = hot ? COL_BG : (cur ? COL_CURSOR : COL_WHITE);
+        rect(x, y, FAV_TILE_W, FAV_TILE_H, hot ? COL_GREEN : RGB565(0, 20, 12));
 
-        rect(rx, y, rw, FAV_ROW_H - 3, bg);
-        if (cur && !hot) vline(rx, y, FAV_ROW_H - 3, COL_CURSOR);
-
-        char b[24];
-        snprintf(b, sizeof b, "%d", i + 1);
-        text(rx + 7, y + 8, 1, fg_idx, b);
-
-        snprintf(b, sizeof b, "%.3f MHz", s_fav[i].hz / 1e6);
-        text(rx + 20, y + 8, 1, fg_frq, b);
+        /* Accent bar on the tuned channel. A fully filled tile would read as
+         * "pressed"; a 3 px bar says "this is where you are" and keeps the
+         * frequency at full contrast. */
+        if (cur && !hot) rect(x, y, 3, FAV_TILE_H, COL_CURSOR);
 
         const char *lab;
         uint16_t mc;
         fav_mode_style(s_fav[i].mode, &lab, &mc);
-        text_r(rx + rw - FAV_DEL_W - 10, y + 8, 1, hot ? COL_BG : mc, lab);
 
-        /* Per-row delete: a small cross, dim until pressed. It sits beside the
-         * row's own tap target, so it must be hard to hit by accident. */
-        int dx = rx + rw - FAV_DEL_W / 2 - 2;
+        char b[24];
+        snprintf(b, sizeof b, "%d", i + 1);
+        text(x + 10, y + 5, 1, hot ? COL_BG : COL_DIM, b);
+        text_r(x + FAV_TILE_W - 8, y + 5, 1, hot ? COL_BG : mc, lab);
+
+        /* Frequency at scale 2: 14 px glyphs, 28 px on the panel. */
+        snprintf(b, sizeof b, "%.3f", s_fav[i].hz / 1e6);
+        text(x + 10, y + 18, 2, hot ? COL_BG : (cur ? COL_CURSOR : COL_WHITE), b);
+        text(x + 13 + text_w(b, 2), y + 26, 1, hot ? COL_BG : COL_DIM, "MHz");
+
+        /* Delete cross in the bottom-right corner. Kept small and inside the
+         * tile so it cannot steal a tap meant for the tile itself. */
+        int dx = x + FAV_TILE_W - 12, dy = y + FAV_TILE_H - 13;
         bool dh = (s_fav_hot == FAV_HIT_DEL(i));
-        if (dh)
-            rect(dx - FAV_DEL_W / 2, y + 3, FAV_DEL_W, FAV_ROW_H - 9, RGB565(70, 14, 14));
-        draw_x(dx, y + FAV_ROW_H / 2 - 1, 3, dh ? COL_RED : RGB565(96, 44, 44));
+        if (dh) rect(dx - 8, dy - 8, 16, 16, RGB565(70, 14, 14));
+        draw_x(dx, dy, FAV_DEL_R, dh ? COL_RED : RGB565(96, 44, 44));
     }
 
     /* --- buttons --------------------------------------------------------- */
