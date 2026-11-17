@@ -6,9 +6,10 @@ live spectrum, waterfall, touch tuning and demodulated audio — no PC needed.
 
 ![Tab5SA running on the M5Stack Tab5](screenshot.png)
 
-If you find this useful and would like to support the work, you can buy me a coffee:
+this project current tested on thr earliest batch of Tab5
+which is ILI9881C + GT911 chipset for the screen.
+the recent batch used ST7123/ST7121 chipset, so you need to modify the code accordingly
 
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/D0U028IVM4)
 
 ## Specs
 
